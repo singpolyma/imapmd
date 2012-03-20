@@ -71,6 +71,9 @@ stdinServer out = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 	command tag "LOGOUT" _ = do
 		putS ("* BYE logout\r\n" ++ tag ++ " OK LOGOUT completed\r\n")
 		hClose stdin
+	-- If the client was expecting to need to send more data
+	-- it may get confused when we just say "OK"
+	command tag "LOGIN" _ = putS (tag ++ " OK LOGIN completed\r\n")
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	noop tag = putS (tag ++ " OK noop\r\n")
 	putS = put . fromString
