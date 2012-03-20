@@ -15,11 +15,14 @@ a <|*|> b = do
 	_ <- b
 	return ()
 
+capabilities :: String
+capabilities = "IMAP4rev1"
+
 main :: IO ()
 main = do
 	_ <- txtHandle stdin -- stdin is text for commands, may switch
 	_ <- binHandle stdout
-	putStr "* PREAUTH IMAP4rev1 ready\r\n"
+	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
 	(stdoutChan, stdinChan) <- liftM2 (,) newChan newChan
 	stdinServer stdoutChan <|*|> (stdoutServer stdoutChan
 		`catch` (\BlockedIndefinitelyOnMVar -> return ()))
@@ -61,7 +64,7 @@ stdinServer out = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 		_ -> putS "* BAD unknown command\r\n"
 	where
 	command tag "CAPABILITY" _ =
-		putS ("* CAPABILITY IMAP4rev1\r\n" ++
+		putS ("* CAPABILITY " ++ capabilities ++ "\r\n" ++
 			tag ++ " OK CAPABILITY completed\r\n")
 	command tag "NOOP" _ = noop tag
 	command tag "CHECK" _ = noop tag
