@@ -23,7 +23,7 @@ main = do
 	_ <- txtHandle stdin -- stdin is text for commands, may switch
 	_ <- binHandle stdout
 	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
-	(stdoutChan, stdinChan) <- liftM2 (,) newChan newChan
+	stdoutChan <- newChan
 	stdinServer stdoutChan <|*|> (stdoutServer stdoutChan
 		`catch` (\BlockedIndefinitelyOnMVar -> return ()))
 
