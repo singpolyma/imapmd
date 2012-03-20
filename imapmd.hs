@@ -66,6 +66,6 @@ stdinServer out = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 		putS ("* BYE logout\r\n" ++ tag ++ " OK LOGOUT completed\r\n")
 		hClose stdin
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
-	noop tag = putS (tag ++ " OK\r\n")
+	noop tag = putS (tag ++ " OK noop\r\n")
 	putS = put . fromString
 	put = writeChan out
