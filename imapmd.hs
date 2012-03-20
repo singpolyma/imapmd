@@ -60,6 +60,9 @@ stdinServer out = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 		(tag:cmd:rest) -> command tag (map toUpper cmd) rest
 		_ -> putS "* BAD unknown command\r\n"
 	where
+	command tag "CAPABILITY" _ =
+		putS ("* CAPABILITY IMAP4rev1\r\n" ++
+			tag ++ " OK CAPABILITY completed\r\n")
 	command tag "NOOP" _ = noop tag
 	command tag "CHECK" _ = noop tag
 	command tag "LOGOUT" _ = do
