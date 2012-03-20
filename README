@@ -1,0 +1,1 @@
+This server starts in the authenticated state (RFC2060 3.2), but accepts the LOGIN command while in that state with *any* username and password and always returns success.  This is for compatability with clients that do not understand the PREAUTH greeting connections.
