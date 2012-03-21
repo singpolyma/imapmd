@@ -146,15 +146,13 @@ stdinServer out maildir = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 	-- If the client was expecting to need to send more data
 	-- it may get confused when we just say "OK"
 	command tag "LOGIN" _ = putS (tag ++ " OK LOGIN completed\r\n")
-	command tag "LIST" args = do
-		arg1m <- pastring args
-		case arg1m of
-			Right (arg1,[]) ->
-				handleErr tag (list tag arg1) =<<
-					pastring =<< fmap words getLine
-			Right (arg1,args) ->
-				handleErr tag (list tag arg1) =<< pastring args
-			_ -> handleErr tag (return.return ()) arg1m
+	command tag "LIST" args =
+		pastring args >>= handleErr tag (\(arg1,args) ->
+			case args of
+				[] -> handleErr tag (list tag arg1) =<<
+						pastring =<< fmap words getLine
+				_ -> handleErr tag (list tag arg1) =<< pastring args
+		)
 	command tag "SELECT" args =
 		pastring args >>= handleErr tag (\arg1 -> do
 			let mbox = toString $ fst arg1
