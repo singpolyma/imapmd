@@ -1,6 +1,7 @@
 import Prelude hiding (catch)
 import Data.Char (toUpper)
 import Data.List
+import Data.Time (getCurrentTime, formatTime, FormatTime)
 import Control.Monad
 import Control.Monad.Error
 import Control.Exception (catch, BlockedIndefinitelyOnMVar(..))
@@ -8,6 +9,7 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import System (getArgs)
 import System.IO
+import System.Locale (defaultTimeLocale)
 import System.Directory
 import Data.ByteString.UTF8 (fromString, toString)
 import qualified Data.ByteString as BS
@@ -23,6 +25,13 @@ a <|*|> b = do
 	_ <- forkIO (a >> return ())
 	_ <- b
 	return ()
+
+strftime :: (FormatTime t) => String -> t -> String
+strftime = formatTime defaultTimeLocale
+
+realDirectoryContents :: FilePath -> IO [FilePath]
+realDirectoryContents path =
+	filter (`notElem` [".",".."]) `fmap` getDirectoryContents path
 
 capabilities :: String
 capabilities = "IMAP4rev1"
@@ -122,7 +131,6 @@ astring _ (hd:rest) = runErrorT $ return (fromString hd, rest)
 stdinServer :: Chan BS.ByteString -> FilePath -> IO ()
 stdinServer out maildir = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 	line <- fmap words getLine
-	hPutStrLn stderr (show line)
 	case line of
 		(tag:cmd:rest) -> command tag (map toUpper cmd) rest
 		_ -> putS "* BAD unknown command\r\n"
@@ -147,6 +155,22 @@ stdinServer out maildir = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 			Right (arg1,args) ->
 				handleErr tag (list tag arg1) =<< pastring args
 			_ -> handleErr tag (return.return ()) arg1m
+	command tag "SELECT" args =
+		pastring args >>= handleErr tag (\arg1 -> do
+			let mbox = toString $ fst arg1
+			let mbox' = if map toUpper mbox == "INBOX" then maildir else
+				FP.joinPath [maildir, mbox]
+			putS "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n"
+			cur <- realDirectoryContents $ FP.joinPath [mbox', "cur"]
+			new <- realDirectoryContents $ FP.joinPath [mbox', "new"]
+			putS $ "* " ++ show (length cur + length new) ++ " EXISTS\r\n"
+			putS $ "* " ++ show (length new) ++ " RECENT\r\n"
+			-- HACK: Using current time as UIDVALIDITY
+			time <- fmap (strftime "%s") getCurrentTime
+			putS $ "* OK [UIDVALIDITY " ++ time ++ "]\r\n"
+			-- XXX: Read only because we have no writing commands yet
+			putS $ tag ++ " OK [READ-ONLY] SELECT completed\r\n"
+		)
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	list tag ctx (box,_) =
 		let pattern = FP.splitDirectories $ FP.normalise
