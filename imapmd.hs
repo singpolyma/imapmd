@@ -36,7 +36,7 @@ binHandle handle = do
 txtHandle :: Handle -> IO Handle
 txtHandle handle = do
 	hSetEncoding handle utf8
-	hSetNewlineMode handle (NewlineMode { inputNL = CRLF, outputNL = CRLF })
+	hSetNewlineMode handle NewlineMode { inputNL = CRLF, outputNL = CRLF }
 	hSetBuffering handle LineBuffering
 	return handle
 
@@ -48,7 +48,7 @@ stdoutServer chan = forever $ do
 while :: IO Bool -> IO () -> IO ()
 while cond action = do
 	b <- cond
-	if b then (action >> while cond action) else return ()
+	when b $ action >> while cond action
 
 -- not `oo` (||) for IO
 (|/|) :: IO Bool -> IO Bool -> IO Bool
