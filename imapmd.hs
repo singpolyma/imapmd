@@ -4,7 +4,7 @@ import Data.List
 import Data.Time (getCurrentTime, formatTime, FormatTime)
 import Control.Monad
 import Control.Monad.Error
-import Control.Exception (catch, BlockedIndefinitelyOnMVar(..))
+import Control.Exception (catch, BlockedIndefinitelyOnMVar(..), SomeException(..))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import System (getArgs)
@@ -43,7 +43,7 @@ main = do
 	_ <- binHandle stdout
 	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
 	stdoutChan <- newChan
-	stdinServer stdoutChan maildir <|*|> (stdoutServer stdoutChan
+	stdinServer stdoutChan maildir Nothing <|*|> (stdoutServer stdoutChan
 		`catch` (\BlockedIndefinitelyOnMVar -> return ()))
 	where
 	first msg [] = error msg
@@ -66,11 +66,6 @@ stdoutServer :: Chan BS.ByteString -> IO ()
 stdoutServer chan = forever $ do
 	bytes <- readChan chan
 	BS.putStr bytes
-
-while :: IO Bool -> IO () -> IO ()
-while cond action = do
-	b <- cond
-	when b $ action >> while cond action
 
 -- not `oo` (||) for IO
 (|/|) :: IO Bool -> IO Bool -> IO Bool
@@ -128,13 +123,21 @@ astring putS (('{':hd):_) = runErrorT $ do -- rest is garbage or []
 	return (bytes,[])
 astring _ (hd:rest) = runErrorT $ return (fromString hd, rest)
 
-stdinServer :: Chan BS.ByteString -> FilePath -> IO ()
-stdinServer out maildir = while (hIsClosed stdin |/| hIsEOF stdin) $ do
+stdinServer :: Chan BS.ByteString -> FilePath -> Maybe FilePath -> IO ()
+stdinServer out maildir selected = do
 	line <- fmap words getLine
+	hPutStrLn stderr (show (selected,line))
 	case line of
-		(tag:cmd:rest) -> command tag (map toUpper cmd) rest
+		(tag:cmd:rest) -> do
+			command tag (map toUpper cmd) rest
+				`catch` (\(SomeException ex) ->
+					putS (tag ++ " BAD " ++ show ex ++ "\r\n")
+				)
 		_ -> putS "* BAD unknown command\r\n"
+	next selected
 	where
+	next sel = (hIsClosed stdin |/| hIsEOF stdin) >>=
+		(`when` stdinServer out maildir sel)
 	command tag "CAPABILITY" _ =
 		putS ("* CAPABILITY " ++ capabilities ++ "\r\n" ++
 			tag ++ " OK CAPABILITY completed\r\n")
@@ -168,6 +171,7 @@ stdinServer out maildir = while (hIsClosed stdin |/| hIsEOF stdin) $ do
 			putS $ "* OK [UIDVALIDITY " ++ time ++ "]\r\n"
 			-- XXX: Read only because we have no writing commands yet
 			putS $ tag ++ " OK [READ-ONLY] SELECT completed\r\n"
+			next (Just mbox')
 		)
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	list tag ctx (box,_) =
