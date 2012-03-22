@@ -210,4 +210,4 @@ stdinServer out maildir selected = do
 	noop tag = putS (tag ++ " OK noop\r\n")
 	pastring = astring putS
 	putS = put . fromString
-	put = writeChan out
+	put x = (writeChan out) $! x
