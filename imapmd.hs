@@ -102,12 +102,12 @@ safeHead :: [a] -> Maybe a
 safeHead [] = Nothing
 safeHead (x:_) = Just x
 
-maybeErr :: (MonadError e m) => e -> Maybe a -> m a
-maybeErr msg Nothing = throwError msg
+maybeErr :: (Monad m) => String -> Maybe a -> m a
+maybeErr msg Nothing = fail msg
 maybeErr _ (Just x) = return x
 
 astring :: (MonadIO m) => (String -> IO ()) -> [String] -> m (Either String (BS.ByteString, [String]))
-astring _ [] = runErrorT $ throwError "Empty argument?"
+astring _ [] = runErrorT $ fail "Empty argument?"
 astring _ (('"':hd):rest) = runErrorT $
 	let (t,r) = token '"' '\\' (unwords $ hd:rest) in
 		return (fromString t, words r)
