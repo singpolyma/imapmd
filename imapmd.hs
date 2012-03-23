@@ -302,6 +302,16 @@ stdinServer out maildir selected = do
 	fetch "RFC882.SIZE" ms = map (\(seq,_,len,_) ->
 			(seq,("RFC882.SIZE", show len))
 		) ms
+	fetch "FLAGS" ms = map (\(seq,pth,_,_) -> (seq,("FLAGS",
+			'(' : (unwords $ foldr (\f acc -> case f of
+				'R' -> "\\Answered" : acc
+				'S' -> "\\Seen" : acc
+				'T' -> "\\Deleted" : acc
+				'D' -> "\\Draft" : acc
+				'F' -> "\\Flagged" : acc
+				_ -> acc
+			) [] (takeWhile (/=',') $ reverse pth)) ++ ")"
+		))) ms
 	fetch _ _ = []
 	handleErr tag _ (Left err) =
 		putS (tag ++ " BAD " ++ err ++ "\r\n")
