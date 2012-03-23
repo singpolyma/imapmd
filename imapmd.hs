@@ -259,7 +259,9 @@ stdinServer out maildir selected = do
 					-- If it was a literal, get more, strip ()
 					rest' <- fmap (words . map toUpper . tail . init . unwords)
 						(if null rest then fmap words getLine else return rest)
-					putS $ show $ concatMap (`fetch` ms) (squishBody rest')
+					putS $ show $ concatMap (\s ->
+							map (\(seq,str) -> (seq,(s,str))) (fetch s ms)
+						) (squishBody rest')
 				)
 			Nothing -> putS (tag ++ " NO select mailbox\r\n")
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
@@ -293,17 +295,17 @@ stdinServer out maildir selected = do
 			putS $ concatMap (\(dir,attr) -> "* LIST (" ++ attr ++ ") " ++
 					show [FP.pathSeparator] ++ " " ++ dir ++ "\r\n"
 				) list ++ (tag ++ " OK LIST completed\r\n")
-	fetch "UID" ms = map (\(seq,_,_,_) -> (seq,("UID", show seq))) ms
-	fetch "INTERNALDATE" ms = map (\(seq,_,_,m) -> (seq, ("INTERNALDATE",
+	fetch "UID" ms = map (\(seq,_,_,_) -> (seq, show seq)) ms
+	fetch "INTERNALDATE" ms = map (\(seq,_,_,m) -> (seq,
 			strftime "%d-%b-%Y %H:%M:%S %z" $ fullDate2UTCTime $
 				fromMaybe MIME.epochDate $ -- epoch if no Date header
-					MIME.mi_date $ MIME.m_message_info m))
+					MIME.mi_date $ MIME.m_message_info m)
 		) ms
 	fetch "RFC882.SIZE" ms = map (\(seq,_,len,_) ->
-			(seq,("RFC882.SIZE", show len))
+			(seq, show len)
 		) ms
-	fetch "FLAGS" ms = map (\(seq,pth,_,_) -> (seq,("FLAGS",
-			'(' : (unwords $ foldr (\f acc -> case f of
+	fetch "FLAGS" ms = map (\(seq,pth,_,_) -> (seq,
+			'(' : unwords (foldr (\f acc -> case f of
 				'R' -> "\\Answered" : acc
 				'S' -> "\\Seen" : acc
 				'T' -> "\\Deleted" : acc
@@ -311,8 +313,8 @@ stdinServer out maildir selected = do
 				'F' -> "\\Flagged" : acc
 				_ -> acc
 			) [] (takeWhile (/=',') $ reverse pth)) ++ ")"
-		))) ms
-	fetch sel ms | "BODY.PREFIX" `isPrefixOf` sel = body (drop 11 sel) ms
+		)) ms
+	fetch sel ms | "BODY.PEEK" `isPrefixOf` sel = body (drop 9 sel) ms
 	fetch sel ms | "BODY" `isPrefixOf` sel =
 		-- TODO: set \Seen on ms
 		body (drop 4 sel) ms
@@ -320,14 +322,18 @@ stdinServer out maildir selected = do
 	body ('[':sel) ms = let (section,partial) = span (/=']') sel in
 		if "HEADER.FIELDS" `isPrefixOf` section then
 			let headers = words $ init $ drop 15 section in
-				concatMap (\(seq,_,_,m) ->
-					foldr (\header acc -> let hn = map toLower header ++ ":" in
-						case find (\hdata -> MIME.h_name hdata == hn)
-							(MIME.mi_headers $ MIME.m_message_info m) of
-							Just hd -> (seq,(header,
-								concat $ MIME.h_raw_header hd)) : acc
-							Nothing -> acc
-					) [] headers
+				map (\(seq,_,_,m) ->
+					let str = (intercalate "\r\n" (
+						foldr (\header acc ->
+							let hn = map toLower header ++ ":" in
+								case find (\hdata -> MIME.h_name hdata == hn)
+									(MIME.mi_headers $ MIME.m_message_info m) of
+									Just hd -> MIME.h_raw_header hd ++ acc
+									Nothing -> acc
+						) [] headers) ++ "\r\n")
+					in
+						-- Length is bytes because headers are US-ASCII
+						(seq, "{" ++ show (length str) ++ "}\r\n" ++ str)
 				) ms
 		else
 			[]
