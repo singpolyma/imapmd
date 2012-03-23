@@ -128,7 +128,7 @@ stdinServer out maildir selected = do
 	line <- fmap words getLine
 	hPutStrLn stderr (show (selected,line))
 	case line of
-		(tag:cmd:rest) -> do
+		(tag:cmd:rest) ->
 			command tag (map toUpper cmd) rest
 				`catch` (\(SomeException ex) ->
 					putS (tag ++ " BAD " ++ show ex ++ "\r\n")
@@ -210,4 +210,4 @@ stdinServer out maildir selected = do
 	noop tag = putS (tag ++ " OK noop\r\n")
 	pastring = astring putS
 	putS = put . fromString
-	put x = (writeChan out) $! x
+	put x = writeChan out $! x
