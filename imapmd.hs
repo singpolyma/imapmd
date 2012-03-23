@@ -1,6 +1,6 @@
 import Prelude hiding (catch)
 import Data.Maybe
-import Data.Char (toUpper)
+import Data.Char (toUpper,toLower)
 import Data.List
 import Data.Time
 import Control.Monad
@@ -312,7 +312,26 @@ stdinServer out maildir selected = do
 				_ -> acc
 			) [] (takeWhile (/=',') $ reverse pth)) ++ ")"
 		))) ms
+	fetch sel ms | "BODY.PREFIX" `isPrefixOf` sel = body (drop 11 sel) ms
+	fetch sel ms | "BODY" `isPrefixOf` sel =
+		-- TODO: set \Seen on ms
+		body (drop 4 sel) ms
 	fetch _ _ = []
+	body ('[':sel) ms = let (section,partial) = span (/=']') sel in
+		if "HEADER.FIELDS" `isPrefixOf` section then
+			let headers = words $ init $ drop 15 section in
+				concatMap (\(seq,_,_,m) ->
+					foldr (\header acc -> let hn = map toLower header ++ ":" in
+						case find (\hdata -> MIME.h_name hdata == hn)
+							(MIME.mi_headers $ MIME.m_message_info m) of
+							Just hd -> (seq,(map toUpper header,
+								concat $ MIME.h_raw_header hd)) : acc
+							Nothing -> acc
+					) [] headers
+				) ms
+		else
+			[]
+	body _ _ = [] -- TODO
 	handleErr tag _ (Left err) =
 		putS (tag ++ " BAD " ++ err ++ "\r\n")
 	handleErr _ f (Right x) = f x
