@@ -257,7 +257,7 @@ stdinServer out maildir selected = do
 							return (seq,pth,length content,MIME.parse content)
 						) (selectMsgs allm (toString msgs))
 					-- If it was a literal, get more, strip ()
-					rest' <- fmap (words . tail . init . unwords)
+					rest' <- fmap (words . map toUpper . tail . init . unwords)
 						(if null rest then fmap words getLine else return rest)
 					putS $ show $ concatMap (`fetch` ms) (squishBody rest')
 				)
@@ -324,7 +324,7 @@ stdinServer out maildir selected = do
 					foldr (\header acc -> let hn = map toLower header ++ ":" in
 						case find (\hdata -> MIME.h_name hdata == hn)
 							(MIME.mi_headers $ MIME.m_message_info m) of
-							Just hd -> (seq,(map toUpper header,
+							Just hd -> (seq,(header,
 								concat $ MIME.h_raw_header hd)) : acc
 							Nothing -> acc
 					) [] headers
