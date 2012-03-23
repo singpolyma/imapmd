@@ -1,7 +1,8 @@
 import Prelude hiding (catch)
+import Data.Maybe
 import Data.Char (toUpper)
 import Data.List
-import Data.Time (getCurrentTime, formatTime, FormatTime)
+import Data.Time
 import Control.Monad
 import Control.Monad.Error
 import Control.Exception (catch, BlockedIndefinitelyOnMVar(..), SomeException(..))
@@ -18,6 +19,25 @@ import qualified System.FilePath.FilePather.Find as FP
 import qualified System.FilePath.FilePather.FilterPredicate as FP
 import qualified System.FilePath.FilePather.FileType as FP
 import qualified System.FilePath.FilePather.RecursePredicate as FP
+import qualified Codec.MIME.String as MIME
+
+months :: [MIME.Month]
+months = [MIME.Jan, MIME.Feb, MIME.Mar, MIME.Apr, MIME.May, MIME.Jun, MIME.Jul, MIME.Aug, MIME.Sep, MIME.Oct, MIME.Nov, MIME.Dec]
+
+instance Enum MIME.Month where
+	fromEnum MIME.Jan = 01
+	fromEnum MIME.Feb = 02
+	fromEnum MIME.Mar = 03
+	fromEnum MIME.Apr = 04
+	fromEnum MIME.May = 05
+	fromEnum MIME.Jun = 06
+	fromEnum MIME.Jul = 07
+	fromEnum MIME.Aug = 08
+	fromEnum MIME.Sep = 09
+	fromEnum MIME.Oct = 10
+	fromEnum MIME.Nov = 11
+	fromEnum MIME.Dec = 12
+	toEnum x = months !! (x - 1)
 
 -- Handy run-concurrently operator
 (<|*|>) :: IO a -> IO b -> IO ()
@@ -29,9 +49,18 @@ a <|*|> b = do
 strftime :: (FormatTime t) => String -> t -> String
 strftime = formatTime defaultTimeLocale
 
+fullDate2UTCTime :: MIME.FullDate -> UTCTime
+fullDate2UTCTime (MIME.FullDate _
+	(MIME.Date day month year)
+	(MIME.Time (MIME.TimeOfDay hour minute msecond) timezone)) =
+	let second = fromMaybe 0 msecond in
+		UTCTime (fromGregorian (toInteger year) (fromEnum month) day)
+			(secondsToDiffTime $ toInteger $
+				(60*60*(hour+timezone)) + (60*minute) + second)
+
 realDirectoryContents :: FilePath -> IO [FilePath]
-realDirectoryContents path =
-	filter (`notElem` [".",".."]) `fmap` getDirectoryContents path
+realDirectoryContents path = (map (\p -> FP.joinPath [path,p]) .
+	filter (`notElem` [".",".."])) `fmap` getDirectoryContents path
 
 capabilities :: String
 capabilities = "IMAP4rev1"
@@ -97,6 +126,49 @@ wildcardMatch ("*":ps) prefix xs =
 wildcardMatch (p:ps) prefix (x:xs)
 	| p == x = wildcardMatch ps prefix xs
 	| otherwise = False
+
+selectMsgs :: [a] -> String -> [a]
+selectMsgs _ [] = []
+selectMsgs xs sel
+	| ':' `elem` this =
+		case (start,end) of
+			(Just s, Just e) ->
+				take ((e-s)+1) (drop (s-1) xs) ++ selectMsgs xs rest
+			_ -> selectMsgs xs rest
+	| otherwise =
+		case fmap (xs!!) thisAsIdx of
+			Just x -> x : selectMsgs xs rest
+			Nothing -> selectMsgs xs rest
+	where
+	start = fmap fst $ safeHead $ reads start'
+	end = fmap fst $ safeHead $ reads $ tail end'
+	(start',end') = span (/=':') this
+	thisAsIdx = fmap (subtract 1 . fst) $ safeHead $ reads this
+	rest = safeTail rest'
+	(this,rest') = span (/=',') sel
+
+squishBody :: [String] -> [String]
+squishBody = squishBody' [] Nothing
+	where
+	squishBody' (a:acc) (Just ']') (w:ws)
+		| last w == ']' =
+			if join (fmap safeHead (safeHead ws)) == Just '<' then
+				squishBody' ((a ++ " " ++ w) : acc) (Just '>') ws
+			else
+				squishBody' ((a ++ " " ++ w) : acc) Nothing ws
+		| otherwise = squishBody' ((a ++ " " ++ w) : acc) (Just ']') ws
+	squishBody' (a:acc) (Just '>') (w:ws)
+		| last w == '>' = squishBody' ((a ++ " " ++ w) : acc) Nothing ws
+		| otherwise = squishBody' ((a ++ " " ++ w) : acc) (Just '>') ws
+	squishBody' acc Nothing (w:ws)
+		| "BODY" `isPrefixOf` w = squishBody' (w:acc) (Just ']') ws
+		| otherwise = squishBody' (w:acc) Nothing ws
+	squishBody' acc _ [] = reverse acc
+	squishBody' _ _ _ = error "programmer error"
+
+safeTail :: [a] -> [a]
+safeTail [] = []
+safeTail (_:tl) = tl
 
 safeHead :: [a] -> Maybe a
 safeHead [] = Nothing
@@ -173,6 +245,23 @@ stdinServer out maildir selected = do
 			putS $ tag ++ " OK [READ-ONLY] SELECT completed\r\n"
 			next (Just mbox')
 		)
+	command tag "FETCH" args =
+		case selected of
+			(Just mbox) ->
+				pastring args >>= handleErr tag (\(msgs,rest) -> do
+					cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
+					new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
+					let allm = zip [(1::Int)..] (cur ++ new)
+					ms <- mapM (\(seq,pth) -> do
+							content <- readFile pth
+							return (seq,pth,length content,MIME.parse content)
+						) (selectMsgs allm (toString msgs))
+					-- If it was a literal, get more, strip ()
+					rest' <- fmap (words . tail . init . unwords)
+						(if null rest then fmap words getLine else return rest)
+					putS $ show $ concatMap (`fetch` ms) (squishBody rest')
+				)
+			Nothing -> putS (tag ++ " NO select mailbox\r\n")
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	list tag ctx (box,_) =
 		let pattern = FP.splitDirectories $ FP.normalise
@@ -204,6 +293,16 @@ stdinServer out maildir selected = do
 			putS $ concatMap (\(dir,attr) -> "* LIST (" ++ attr ++ ") " ++
 					show [FP.pathSeparator] ++ " " ++ dir ++ "\r\n"
 				) list ++ (tag ++ " OK LIST completed\r\n")
+	fetch "UID" ms = map (\(seq,_,_,_) -> (seq,("UID", show seq))) ms
+	fetch "INTERNALDATE" ms = map (\(seq,_,_,m) -> (seq, ("INTERNALDATE",
+			strftime "%d-%b-%Y %H:%M:%S %z" $ fullDate2UTCTime $
+				fromMaybe MIME.epochDate $ -- epoch if no Date header
+					MIME.mi_date $ MIME.m_message_info m))
+		) ms
+	fetch "RFC882.SIZE" ms = map (\(seq,_,len,_) ->
+			(seq,("RFC882.SIZE", show len))
+		) ms
+	fetch _ _ = []
 	handleErr tag _ (Left err) =
 		putS (tag ++ " BAD " ++ err ++ "\r\n")
 	handleErr _ f (Right x) = f x
