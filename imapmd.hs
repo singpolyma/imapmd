@@ -180,6 +180,15 @@ maybeErr :: (Monad m) => String -> Maybe a -> m a
 maybeErr msg Nothing = fail msg
 maybeErr _ (Just x) = return x
 
+stp :: Char -> Char -> String -> String
+stp lead trail [] = []
+stp lead trail (l:str) | l == lead = stpTrail str
+                       | otherwise = stpTrail (l:str)
+	where
+	stpTrail [] = []
+	stpTrail s | last s == trail = init s
+	stpTrail s | otherwise = s
+
 astring :: (MonadIO m) => (String -> IO ()) -> [String] -> m (Either String (BS.ByteString, [String]))
 astring _ [] = runErrorT $ fail "Empty argument?"
 astring _ (('"':hd):rest) = runErrorT $
@@ -256,22 +265,25 @@ stdinServer out maildir selected = do
 					let allm = zip [(1::Int)..] (cur ++ new)
 					ms <- mapM (\(seq,pth) -> do
 							content <- readFile pth
-							return (seq,pth,length content,MIME.parse content)
+							return (seq,pth,content,MIME.parse content)
 						) (selectMsgs allm (toString msgs))
 					-- If it was a literal, get more, strip ()
-					rest' <- fmap (words . map toUpper . tail . init . unwords)
+					rest' <- fmap (words . map toUpper . stp '(' ')' . unwords)
 						(if null rest then fmap words getLine else return rest)
 					mapM_ (\(seq,ps) -> putS $
 							unwords ["*",show seq,"FETCH ("++ unwords ps ++")"] ++ "\r\n"
 						) $ Map.toList $ Map.fromListWith (++) $
 							concatMap (\s ->
 								map (\(seq,str) ->
-									(seq, [s,str])
+									(seq, [stripPeek s,str])
 								) (fetch s ms)
-							) (squishBody rest')
+							) (nub ("UID":(squishBody rest')))
 					putS (tag ++ " OK fetch complete\r\n")
 				)
 			Nothing -> putS (tag ++ " NO select mailbox\r\n")
+	command tag "UID" (cmd:args) =
+		-- XXX: when UIDs become seperate from seq#, need to transform here
+		command tag (map toUpper cmd) args
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	list tag ctx (box,_) =
 		let pattern = FP.splitDirectories $ FP.normalise
@@ -309,8 +321,8 @@ stdinServer out maildir selected = do
 				fromMaybe MIME.epochDate $ -- epoch if no Date header
 					MIME.mi_date $ MIME.m_message_info m)
 		) ms
-	fetch "RFC822.SIZE" ms = map (\(seq,_,len,_) ->
-			(seq, show len)
+	fetch "RFC822.SIZE" ms = map (\(seq,_,raw,_) ->
+			(seq, show $ length raw)
 		) ms
 	fetch "FLAGS" ms = map (\(seq,pth,_,_) -> (seq,
 			'(' : unwords (foldr (\f acc -> case f of
@@ -328,28 +340,33 @@ stdinServer out maildir selected = do
 		body (drop 4 sel) ms
 	fetch _ _ = []
 	body ('[':sel) ms = let (section,partial) = span (/=']') sel in
-		if "HEADER.FIELDS" `isPrefixOf` section then
-			let headers = words $ init $ drop 15 section in
-				map (\(seq,_,_,m) ->
-					let str = (intercalate "\r\n" (
-						foldr (\header acc ->
-							let hn = map toLower header ++ ":" in
-								case find (\hdata -> MIME.h_name hdata == hn)
-									(MIME.mi_headers $ MIME.m_message_info m) of
-									Just hd -> MIME.h_raw_header hd ++ acc
-									Nothing -> acc
-						) [] headers) ++ "\r\n")
-					in
-						-- Length is bytes because headers are US-ASCII
-						(seq, "{" ++ show (length str) ++ "}\r\n" ++ str)
+		case section of
+			[] -> map (\(seq,_,raw,_) ->
+					(seq, "{" ++ show (length raw) ++ "}\r\n" ++ raw)
 				) ms
-		else
-			[]
+			_ | "HEADER.FIELDS" `isPrefixOf` section ->
+				let headers = words $ init $ drop 15 section in
+					map (\(seq,_,_,m) ->
+						let str = (intercalate "\r\n" (
+							foldr (\header acc ->
+								let hn = map toLower header ++ ":" in
+									case find (\hdata -> MIME.h_name hdata == hn)
+										(MIME.mi_headers $ MIME.m_message_info m) of
+										Just hd -> MIME.h_raw_header hd ++ acc
+										Nothing -> acc
+							) [] headers) ++ "\r\n")
+						in
+							-- Length is bytes because headers are US-ASCII
+							(seq, "{" ++ show (length str) ++ "}\r\n" ++ str)
+					) ms
+			_ -> [] -- TODO
 	body _ _ = [] -- TODO
 	handleErr tag _ (Left err) =
 		putS (tag ++ " BAD " ++ err ++ "\r\n")
 	handleErr _ f (Right x) = f x
 	noop tag = putS (tag ++ " OK noop\r\n")
 	pastring = astring putS
+	stripPeek str | "BODY.PEEK" `isPrefixOf` str = "BODY" ++ (drop 9 str)
+	stripPeek str = str
 	putS = put . fromString
 	put x = writeChan out $! x
