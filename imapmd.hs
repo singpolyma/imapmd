@@ -20,6 +20,8 @@ import qualified System.FilePath.FilePather.FilterPredicate as FP
 import qualified System.FilePath.FilePather.FileType as FP
 import qualified System.FilePath.FilePather.RecursePredicate as FP
 import qualified Codec.MIME.String as MIME
+import Data.Map (Map)
+import qualified Data.Map as Map
 
 months :: [MIME.Month]
 months = [MIME.Jan, MIME.Feb, MIME.Mar, MIME.Apr, MIME.May, MIME.Jun, MIME.Jul, MIME.Aug, MIME.Sep, MIME.Oct, MIME.Nov, MIME.Dec]
@@ -259,9 +261,15 @@ stdinServer out maildir selected = do
 					-- If it was a literal, get more, strip ()
 					rest' <- fmap (words . map toUpper . tail . init . unwords)
 						(if null rest then fmap words getLine else return rest)
-					putS $ show $ concatMap (\s ->
-							map (\(seq,str) -> (seq,(s,str))) (fetch s ms)
-						) (squishBody rest')
+					mapM_ (\(seq,ps) -> putS $
+							unwords ["*",show seq,"FETCH ("++ unwords ps ++")"] ++ "\r\n"
+						) $ Map.toList $ Map.fromListWith (++) $
+							concatMap (\s ->
+								map (\(seq,str) ->
+									(seq, [s,str])
+								) (fetch s ms)
+							) (squishBody rest')
+					putS (tag ++ " OK fetch complete\r\n")
 				)
 			Nothing -> putS (tag ++ " NO select mailbox\r\n")
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
@@ -297,11 +305,11 @@ stdinServer out maildir selected = do
 				) list ++ (tag ++ " OK LIST completed\r\n")
 	fetch "UID" ms = map (\(seq,_,_,_) -> (seq, show seq)) ms
 	fetch "INTERNALDATE" ms = map (\(seq,_,_,m) -> (seq,
-			strftime "%d-%b-%Y %H:%M:%S %z" $ fullDate2UTCTime $
+			strftime "\"%d-%b-%Y %H:%M:%S %z\"" $ fullDate2UTCTime $
 				fromMaybe MIME.epochDate $ -- epoch if no Date header
 					MIME.mi_date $ MIME.m_message_info m)
 		) ms
-	fetch "RFC882.SIZE" ms = map (\(seq,_,len,_) ->
+	fetch "RFC822.SIZE" ms = map (\(seq,_,len,_) ->
 			(seq, show len)
 		) ms
 	fetch "FLAGS" ms = map (\(seq,pth,_,_) -> (seq,
