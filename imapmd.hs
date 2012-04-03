@@ -342,17 +342,19 @@ stdinServer out maildir selected = do
 				(map fromString ["{",show (BS.length raw),"}\r\n"]) ++ [raw])
 			_ | "HEADER.FIELDS" `isPrefixOf` section ->
 				let headers = words $ init $ drop 15 section in
-					let str = (intercalate "\r\n" (
-						foldr (\header acc ->
-							let hn = map toLower header ++ ":" in
-								case find (\hdata -> MIME.h_name hdata == hn)
-									(MIME.mi_headers $ MIME.m_message_info m) of
-									Just hd -> MIME.h_raw_header hd ++ acc
-									Nothing -> acc
-						) [] headers) ++ "\r\n")
+					let
+						str = (intercalate "\r\n" (
+							foldr (\header acc ->
+								let hn = map toLower header ++ ":" in
+									case find (\hdata -> MIME.h_name hdata == hn)
+										(MIME.mi_headers $ MIME.m_message_info m) of
+										Just hd -> MIME.h_raw_header hd ++ acc
+										Nothing -> acc
+							) [] headers) ++ "\r\n")
+						bstr = fromString str
+						l = fromString ("{" ++ show (BS.length bstr) ++ "}\r\n")
 					in
-						-- Length is bytes because headers are US-ASCII
-						fromString ("{" ++ show (length str) ++ "}\r\n" ++ str)
+						BS.append l bstr
 			_ -> BS.empty -- TODO
 	body _ _ _= BS.empty -- TODO
 	handleErr tag _ (Left err) =
