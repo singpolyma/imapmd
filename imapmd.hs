@@ -20,8 +20,6 @@ import qualified System.FilePath.FilePather.FilterPredicate as FP
 import qualified System.FilePath.FilePather.FileType as FP
 import qualified System.FilePath.FilePather.RecursePredicate as FP
 import qualified Codec.MIME.String as MIME
-import Data.Map (Map)
-import qualified Data.Map as Map
 
 months :: [MIME.Month]
 months = [MIME.Jan, MIME.Feb, MIME.Mar, MIME.Apr, MIME.May, MIME.Jun, MIME.Jul, MIME.Aug, MIME.Sep, MIME.Oct, MIME.Nov, MIME.Dec]
@@ -263,21 +261,23 @@ stdinServer out maildir selected = do
 					cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
 					new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
 					let allm = zip [(1::Int)..] (cur ++ new)
-					ms <- mapM (\(seq,pth) -> do
-							content <- readFile pth
-							return (seq,pth,content,MIME.parse content)
-						) (selectMsgs allm (toString msgs))
 					-- If it was a literal, get more, strip ()
 					rest' <- fmap (words . map toUpper . stp '(' ')' . unwords)
 						(if null rest then fmap words getLine else return rest)
-					mapM_ (\(seq,ps) -> putS $
-							unwords ["*",show seq,"FETCH ("++ unwords ps ++")"] ++ "\r\n"
-						) $ Map.toList $ Map.fromListWith (++) $
-							concatMap (\s ->
-								map (\(seq,str) ->
-									(seq, [stripPeek s,str])
-								) (fetch s ms)
-							) (nub ("UID":(squishBody rest')))
+					let selectors = nub ("UID":(squishBody rest'))
+
+					mapM_ (\(seq,pth) -> do
+							content <- BS.readFile pth
+							let m = MIME.parse $ toString content
+							let f = fromString $ unwords ["*",show seq,"FETCH ("]
+							let b = fromString ")\r\n"
+							let bsunwords = BS.intercalate (fromString " ")
+							put $ BS.concat [f,(bsunwords $ map (\sel ->
+									bsunwords [fromString (stripPeek sel),
+										fetch sel seq pth content m]
+								) selectors),b]
+						) (selectMsgs allm (toString msgs))
+
 					putS (tag ++ " OK fetch complete\r\n")
 				)
 			Nothing -> putS (tag ++ " NO select mailbox\r\n")
@@ -315,52 +315,46 @@ stdinServer out maildir selected = do
 			putS $ concatMap (\(dir,attr) -> "* LIST (" ++ attr ++ ") " ++
 					show [FP.pathSeparator] ++ " " ++ dir ++ "\r\n"
 				) list ++ (tag ++ " OK LIST completed\r\n")
-	fetch "UID" ms = map (\(seq,_,_,_) -> (seq, show seq)) ms
-	fetch "INTERNALDATE" ms = map (\(seq,_,_,m) -> (seq,
-			strftime "\"%d-%b-%Y %H:%M:%S %z\"" $ fullDate2UTCTime $
-				fromMaybe MIME.epochDate $ -- epoch if no Date header
-					MIME.mi_date $ MIME.m_message_info m)
-		) ms
-	fetch "RFC822.SIZE" ms = map (\(seq,_,raw,_) ->
-			(seq, show $ length raw)
-		) ms
-	fetch "FLAGS" ms = map (\(seq,pth,_,_) -> (seq,
-			'(' : unwords (foldr (\f acc -> case f of
-				'R' -> "\\Answered" : acc
-				'S' -> "\\Seen" : acc
-				'T' -> "\\Deleted" : acc
-				'D' -> "\\Draft" : acc
-				'F' -> "\\Flagged" : acc
-				_ -> acc
-			) [] (takeWhile (/=',') $ reverse pth)) ++ ")"
-		)) ms
-	fetch sel ms | "BODY.PEEK" `isPrefixOf` sel = body (drop 9 sel) ms
-	fetch sel ms | "BODY" `isPrefixOf` sel =
+	fetch "UID" seq _ _ _ = fromString $ show seq
+	fetch "INTERNALDATE" _ _ _ m = fromString $
+		strftime "\"%d-%b-%Y %H:%M:%S %z\"" $ fullDate2UTCTime $
+			fromMaybe MIME.epochDate $ -- epoch if no Date header
+				MIME.mi_date $ MIME.m_message_info m
+	fetch "RFC822.SIZE" _ _ raw _ = fromString $ show $ BS.length raw
+	fetch "FLAGS" _ pth _ _ = fromString $
+		'(' : unwords (foldr (\f acc -> case f of
+			'R' -> "\\Answered" : acc
+			'S' -> "\\Seen" : acc
+			'T' -> "\\Deleted" : acc
+			'D' -> "\\Draft" : acc
+			'F' -> "\\Flagged" : acc
+			_ -> acc
+		) [] (takeWhile (/=',') $ reverse pth)) ++ ")"
+	fetch sel _ _ raw m | "BODY.PEEK" `isPrefixOf` sel =
+		body (drop 9 sel) raw m
+	fetch sel _ _ raw m | "BODY" `isPrefixOf` sel =
 		-- TODO: set \Seen on ms
-		body (drop 4 sel) ms
-	fetch _ _ = []
-	body ('[':sel) ms = let (section,partial) = span (/=']') sel in
+		body (drop 4 sel) raw m
+	fetch _ _ _ _ _ = BS.empty
+	body ('[':sel) raw m = let (section,partial) = span (/=']') sel in
 		case section of
-			[] -> map (\(seq,_,raw,_) ->
-					(seq, "{" ++ show (length raw) ++ "}\r\n" ++ raw)
-				) ms
+			[] -> BS.concat (
+				(map fromString ["{",show (BS.length raw),"}\r\n"]) ++ [raw])
 			_ | "HEADER.FIELDS" `isPrefixOf` section ->
 				let headers = words $ init $ drop 15 section in
-					map (\(seq,_,_,m) ->
-						let str = (intercalate "\r\n" (
-							foldr (\header acc ->
-								let hn = map toLower header ++ ":" in
-									case find (\hdata -> MIME.h_name hdata == hn)
-										(MIME.mi_headers $ MIME.m_message_info m) of
-										Just hd -> MIME.h_raw_header hd ++ acc
-										Nothing -> acc
-							) [] headers) ++ "\r\n")
-						in
-							-- Length is bytes because headers are US-ASCII
-							(seq, "{" ++ show (length str) ++ "}\r\n" ++ str)
-					) ms
-			_ -> [] -- TODO
-	body _ _ = [] -- TODO
+					let str = (intercalate "\r\n" (
+						foldr (\header acc ->
+							let hn = map toLower header ++ ":" in
+								case find (\hdata -> MIME.h_name hdata == hn)
+									(MIME.mi_headers $ MIME.m_message_info m) of
+									Just hd -> MIME.h_raw_header hd ++ acc
+									Nothing -> acc
+						) [] headers) ++ "\r\n")
+					in
+						-- Length is bytes because headers are US-ASCII
+						fromString ("{" ++ show (length str) ++ "}\r\n" ++ str)
+			_ -> BS.empty -- TODO
+	body _ _ _= BS.empty -- TODO
 	handleErr tag _ (Left err) =
 		putS (tag ++ " BAD " ++ err ++ "\r\n")
 	handleErr _ f (Right x) = f x
