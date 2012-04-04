@@ -147,6 +147,16 @@ selectMsgs xs sel
 	rest = safeTail rest'
 	(this,rest') = span (/=',') sel
 
+maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
+maildirFind fpred rpred mbox = FP.find
+	(FP.filterPredicate (\x t -> FP.isDirectory t && normPred fpred x))
+	(FP.recursePredicate (normPred rpred))
+	mbox
+	where
+	normPred pred x =
+		let s = FP.splitDirectories $ FP.normalise x in
+			last s `notElem` ["new","cur","tmp"] && pred s
+
 squishBody :: [String] -> [String]
 squishBody = squishBody' [] Nothing
 	where
@@ -289,19 +299,8 @@ stdinServer out maildir selected = do
 		let pattern = FP.splitDirectories $ FP.normalise
 			(FP.joinPath [maildir, toString ctx, toString box])
 		in do
-			matches <- FP.find
-				(FP.filterPredicate (\x t ->
-					FP.isDirectory t &&
-						let s = FP.splitDirectories $ FP.normalise x in
-							last s `notElem` ["new","cur","tmp"] &&
-								wildcardMatch pattern False s
-				))
-				(FP.recursePredicate (\x ->
-					let s = FP.splitDirectories $ FP.normalise x in
-						last s `notElem` ["new","cur","tmp"] &&
-							wildcardMatch pattern True s
-				))
-				maildir
+			matches <- maildirFind (wildcardMatch pattern False)
+				(wildcardMatch pattern True) maildir
 			list <- mapM (\x -> let dir = FP.makeRelative maildir x in
 					doesDirectoryExist (FP.joinPath [x,"cur"]) >>= (\isDir ->
 						if isDir then
