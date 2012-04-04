@@ -196,7 +196,7 @@ stp lead trail (l:str) | l == lead = stpTrail str
 	where
 	stpTrail [] = []
 	stpTrail s | last s == trail = init s
-	stpTrail s | otherwise = s
+	stpTrail s = s
 
 astring :: (MonadIO m) => (String -> IO ()) -> [String] -> m (Either String (BS.ByteString, [String]))
 astring _ [] = runErrorT $ fail "Empty argument?"
@@ -275,7 +275,7 @@ stdinServer out maildir selected = do
 					-- If it was a literal, get more, strip ()
 					rest' <- fmap (words . map toUpper . stp '(' ')' . unwords)
 						(if null rest then fmap words getLine else return rest)
-					let selectors = nub ("UID":(squishBody rest'))
+					let selectors = nub ("UID" : squishBody rest')
 
 					mapM_ (\(seq,pth) -> do
 							content <- unsafeInterleaveIO $ BS.readFile pth
@@ -283,10 +283,10 @@ stdinServer out maildir selected = do
 							let f = fromString $ unwords ["*",show seq,"FETCH ("]
 							let b = fromString ")\r\n"
 							let bsunwords = BS.intercalate (fromString " ")
-							put $ BS.concat [f,(bsunwords $ map (\sel ->
+							put $ BS.concat [f,bsunwords $ map (\sel ->
 									bsunwords [fromString (stripPeek sel),
 										fetch sel seq pth content m]
-								) selectors),b]
+								) selectors,b]
 						) (selectMsgs allm (toString msgs))
 
 					putS (tag ++ " OK fetch complete\r\n")
@@ -339,7 +339,7 @@ stdinServer out maildir selected = do
 	body ('[':sel) raw m = let (section,partial) = span (/=']') sel in
 		case section of
 			[] -> BS.concat (
-				(map fromString ["{",show (BS.length raw),"}\r\n"]) ++ [raw])
+				map fromString ["{",show (BS.length raw),"}\r\n"] ++ [raw])
 			_ | "HEADER.FIELDS" `isPrefixOf` section ->
 				let headers = words $ init $ drop 15 section in
 					let
@@ -362,7 +362,7 @@ stdinServer out maildir selected = do
 	handleErr _ f (Right x) = f x
 	noop tag = putS (tag ++ " OK noop\r\n")
 	pastring = astring putS
-	stripPeek str | "BODY.PEEK" `isPrefixOf` str = "BODY" ++ (drop 9 str)
+	stripPeek str | "BODY.PEEK" `isPrefixOf` str = "BODY" ++ drop 9 str
 	stripPeek str = str
 	putS = put . fromString
 	put x = writeChan out $! x
