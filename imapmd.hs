@@ -10,6 +10,7 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import System (getArgs)
 import System.IO
+import System.IO.Unsafe (unsafeInterleaveIO)
 import System.Locale (defaultTimeLocale)
 import System.Directory
 import Data.ByteString.UTF8 (fromString, toString)
@@ -277,7 +278,7 @@ stdinServer out maildir selected = do
 					let selectors = nub ("UID":(squishBody rest'))
 
 					mapM_ (\(seq,pth) -> do
-							content <- BS.readFile pth
+							content <- unsafeInterleaveIO $ BS.readFile pth
 							let m = MIME.parse $ toString content
 							let f = fromString $ unwords ["*",show seq,"FETCH ("]
 							let b = fromString ")\r\n"
