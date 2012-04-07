@@ -1,0 +1,1 @@
+I think there's a bug in that the order of messages from the filesystem are not the same every time.  The order in the uidlist should be trusted instead, somehow.
