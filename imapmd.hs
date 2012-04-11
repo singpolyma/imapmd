@@ -371,6 +371,32 @@ instance Read MessageSelector where
 		Just (s,rest) -> [(s : fst (head $ readList rest), "")]
 		Nothing -> [([],"")]
 
+-- Convert selectors over UIDs to a selector over SeqNums
+selectUIDs :: Chan PthMsg -> FilePath -> [MessageSelector] -> IO [MessageSelector]
+selectUIDs getpth mbox mselectors =
+	mapM (\x -> case x of
+		(SelectMessage (SelectNum m)) ->
+			fmap (SelectMessage . sq2sl) $
+			syncCall getpth (MsgSeq mbox (UID m) False)
+		(SelectMessageRange (SelectNum s) (SelectNum e)) ->
+			liftM2 SelectMessageRange
+			(fmap sq2sl $
+				syncCall getpth (MsgSeq mbox (UID s) True))
+			(fmap sq2sl $
+				syncCall getpth (MsgSeq mbox (UID e) True))
+		(SelectMessageRange (SelectNum s) SelectNumStar) ->
+			fmap (`SelectMessageRange` SelectNumStar)
+			(fmap sq2sl $
+				syncCall getpth (MsgSeq mbox (UID s) True))
+		(SelectMessageRange SelectNumStar (SelectNum e)) ->
+			fmap (SelectMessageRange SelectNumStar)
+			(fmap sq2sl $
+				syncCall getpth (MsgSeq mbox (UID e) True))
+		_ -> return x
+	) mselectors
+	where
+	sq2sl (SeqNum i) = SelectNum i
+
 -- Take the items from the list as specified by MessageSelector
 selectMsgs :: Vector a -> [MessageSelector] -> [(SeqNum,a)]
 selectMsgs _ [] = []
@@ -383,6 +409,18 @@ selectMsgs xs (SelectMessageRange s e : rest) =
 selectMsgs xs (SelectMessage x : rest) =
 	let x' = selectToSeq x (toEnum $ Vector.length xs - 1) in
 	(x',(Vector.!) xs (fromEnum x')) : selectMsgs xs rest
+
+imapSearch :: Chan PthMsg -> FilePath -> Vector (UID, FilePath) -> [String] -> IO [(UID,SeqNum)]
+imapSearch _ _ _ [] = return []
+imapSearch getpth mbox xs (q:a:_) | map toUpper q == "UID" = do
+	-- a is a message selector, but with UIDs
+	-- TODO: we are ignoring the rest of the query here
+	fmap (map ((\(s,(u,_)) -> (u,s))) . selectMsgs xs)
+		(selectUIDs getpth mbox (read a))
+imapSearch _ _ xs (q:_) = do
+	-- try SeqNum message set as last resort?
+	return $ (map ((\(s,(u,_)) -> (u,s))) . selectMsgs xs) (read q)
+--imapSearch _ _ _ _ = error "Unsupported IMAP search query"
 
 maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
 maildirFind fpred rpred mbox = FP.find
@@ -503,9 +541,18 @@ stdinServer out getpth maildir selected = do
 			next (Just mbox')
 		)
 	command tag "FETCH" args = fetch_cmd False tag args
+	command tag "SEARCH" _ = putS $ tag ++ " NO unsupported query\r\n"
 	command tag "UID" (cmd:args) =
 		case map toUpper cmd of
 			"FETCH" -> fetch_cmd True tag args
+			"SEARCH" ->
+				case selected of
+					(Just mbox) -> do
+						msgs <- syncCall getpth (MsgAll mbox)
+						r <- imapSearch getpth mbox msgs args
+						putS $ "* SEARCH " ++ unwords (map (show.fst) r) ++ "\r\n"
+						putS $ tag ++ " OK search done\r\n"
+					Nothing -> putS $ tag ++ " NO select mailbox\r\n"
 			_ -> putS (tag ++ " BAD uid command\r\n")
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	list tag ctx (box,_) =
@@ -537,28 +584,7 @@ stdinServer out getpth maildir selected = do
 					let selectors = nub ("UID" : squishBody rest')
 					let mselectors = read (toString msgs)
 					mselectors' <- if not useUID then return mselectors else
-						let sq2sl (SeqNum i) = SelectNum i in
-						-- Convert UIDs to SeqNums
-						mapM (\x -> case x of
-							(SelectMessage (SelectNum m)) ->
-								fmap (SelectMessage . sq2sl) $
-								syncCall getpth (MsgSeq mbox (UID m) False)
-							(SelectMessageRange (SelectNum s) (SelectNum e)) ->
-								liftM2 SelectMessageRange
-								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID s) True))
-								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID e) True))
-							(SelectMessageRange (SelectNum s) SelectNumStar) ->
-								fmap (`SelectMessageRange` SelectNumStar)
-								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID s) True))
-							(SelectMessageRange SelectNumStar (SelectNum e)) ->
-								fmap (SelectMessageRange SelectNumStar)
-								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID e) True))
-							_ -> return x
-						) mselectors
+						selectUIDs getpth mbox mselectors
 
 					allm <- syncCall getpth (MsgAll mbox)
 					mapM_ (\(SeqNum seq,(muid,pth)) -> do
