@@ -1,8 +1,11 @@
 import Prelude hiding (catch)
-import Data.Maybe
+import Data.Ord (comparing)
 import Data.Char (toUpper,toLower)
 import Data.List
 import Data.Time
+import Data.Maybe
+import Data.Foldable (toList)
+import Control.Arrow (first)
 import Control.Monad
 import Control.Monad.Error
 import Control.Exception (catch, BlockedIndefinitelyOnMVar(..), SomeException(..))
@@ -14,6 +17,9 @@ import System.IO.Unsafe (unsafeInterleaveIO)
 import System.Locale (defaultTimeLocale)
 import System.Directory
 import Data.ByteString.UTF8 (fromString, toString)
+import Numeric.Search.Range (searchFromTo)
+import Data.Sequence (Seq)
+import qualified Data.Sequence as Seq
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString as BS
@@ -70,19 +76,17 @@ capabilities = "IMAP4rev1"
 
 main :: IO ()
 main = do
-	maildir <- fmap (first "Please specify a Maildir") getArgs
+	maildir <- (fromMaybe (error "No Maildir specified") . safeHead)
+		`fmap` getArgs
 	_ <- txtHandle stdin -- stdin is text for commands, may switch
 	_ <- binHandle stdout
 	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
 	stdoutChan <- newChan
-	uidChan <- newChan
-	stdinServer stdoutChan uidChan maildir Nothing <|*|>
-		uidServer maildir uidChan <|*|>
+	pthChan <- newChan
+	stdinServer stdoutChan pthChan maildir Nothing <|*|>
+		pthServer maildir pthChan <|*|>
 		(stdoutServer stdoutChan
 			`catch` (\BlockedIndefinitelyOnMVar -> return ()))
-	where
-	first msg [] = error msg
-	first _ (x:_) = x
 
 binHandle :: Handle -> IO Handle
 binHandle handle = do
@@ -102,97 +106,136 @@ stdoutServer chan = forever $ do
 	bytes <- readChan chan
 	BS.putStr bytes
 
-newtype UID = UID Int deriving (Show, Read, Eq, Ord)
-newtype Seq = Seq Int deriving (Show, Read, Eq, Ord)
-data UIDMsg =
-	PathFromUID FilePath UID (Chan (Maybe FilePath)) |
-	SeqFromUID FilePath UID (Chan (Maybe Seq)) |
-	UIDFromSeq FilePath Seq (Chan (Maybe UID)) |
-	UIDValidity FilePath (Chan (Maybe Int)) |
-	UIDNext FilePath (Chan (Maybe UID))
+-- Sequence numbers and UIDs both start from 1, but indices start from 0
+newtype UID = UID Int deriving (Eq, Ord)
 
-uidServer :: FilePath -> Chan UIDMsg -> IO ()
-uidServer root chan = do
+instance Enum UID where
+	fromEnum (UID i) = i-1
+	toEnum i = UID (i+1)
+
+instance Show UID where
+	show (UID i) = show i
+
+instance Read UID where
+	readsPrec p s = map (first UID) $ readsPrec p s
+
+newtype SeqNum = SeqNum Int deriving (Show, Read, Eq, Ord)
+
+instance Enum SeqNum where
+	fromEnum (SeqNum i) = i-1
+	toEnum i = SeqNum (i+1)
+
+data PthMsg =
+	MsgAll FilePath (Chan (Seq (UID,FilePath))) |
+	MsgCount FilePath (Chan Int) |
+	MsgPath FilePath SeqNum (Chan FilePath) |
+	MsgUID FilePath SeqNum (Chan UID) |
+	MsgSeq FilePath UID (Chan SeqNum) |
+	UIDValidity FilePath (Chan Int) |
+	UIDNext FilePath (Chan UID)
+
+pthServer :: FilePath -> Chan PthMsg -> IO ()
+pthServer root chan = do
 	mboxes <- maildirFind (const True) (const True) root >>=
 		filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
 	maps <- mapM (\mbox -> do
 			exist <- doesFileExist (FP.joinPath [mbox,"uidlist"])
 			time <- fmap (strftime "%s") getCurrentTime
 			ms <- if exist then parseUidlist mbox else
-				return (read time, UID 1, Map.empty, Map.empty)
-			complete <- writeUidlist ms mbox
-			return (mbox, complete)
+				return (read time, UID 1, Map.empty)
+			(valid,nuid,sorted) <- writeUidlist ms mbox
+			return (mbox, (valid,nuid,Seq.fromList sorted))
 		) mboxes
-	uidServer' (Map.fromList maps)
+	pthServer' (Map.fromList maps)
 	where
-	uidServer' maps = do
+	pthServer' maps = do
 		msg <- readChan chan
 		case msg of
-			(UIDFromSeq mbox seq r) ->
-				writeChan r ((\(_,_,m,_) ->
-					Map.lookup seq m) =<< Map.lookup mbox maps)
-			(SeqFromUID mbox uid r) -> -- SLOW
-				writeChan r ((\(_,_,m,_) ->
-					fmap fst $ find ((==uid) . snd) $
-						Map.toList m) =<< Map.lookup mbox maps)
-			(PathFromUID mbox uid r) ->
-				writeChan r ((\(_,_,_,m) ->
-					Map.lookup uid m) =<< Map.lookup mbox maps)
+			(MsgAll mbox r) -> writeChan r (trd3 $ getMbox mbox maps)
+			(MsgCount mbox r) -> writeChan r $
+				Seq.length $ trd3 $ getMbox mbox maps
+			(MsgUID mbox s r) -> writeChan r $
+				fst $ Seq.index (trd3 $ getMbox mbox maps) (fromEnum s)
+			(MsgSeq mbox uid r) -> writeChan r $
+				case findUID (trd3 $ getMbox mbox maps) uid of
+					Just i -> toEnum i
+					Nothing -> error ("UID " ++ show uid ++ "out of range")
+			(MsgPath mbox s r) -> writeChan r $
+				snd $ Seq.index (trd3 $ getMbox mbox maps) (fromEnum s)
 			(UIDValidity mbox r) ->
-				writeChan r (fmap (\(v,_,_,_) -> v) (Map.lookup mbox maps))
+				writeChan r (fst3 $ getMbox mbox maps)
 			(UIDNext mbox r) ->
-				writeChan r (fmap (\(_,n,_,_) -> n) (Map.lookup mbox maps))
-		uidServer' maps
+				writeChan r (snd3 $ getMbox mbox maps)
+		pthServer' maps
+	fst3 (v,_,_) = v
+	snd3 (_,n,_) = n
+	trd3 (_,_,m) = m
+	getMbox mbox maps = fromMaybe (error ("No mailbox " ++ mbox)) $
+		Map.lookup mbox maps
+	findUID sequence uid = do
+		let (l,h) = (0, Seq.length sequence - 1)
+		k <- searchFromTo (\i -> fst (Seq.index sequence i) >= uid) l h
+		guard (fst (Seq.index sequence k) == uid)
+		return k
 
 taggedItem :: Char -> [String] -> String
 taggedItem _ [] = error "No such item"
-taggedItem c ((t:r):ws) | t == c = r
+taggedItem c ((t:r):_) | t == c = r
 taggedItem c (_:ws) = taggedItem c ws
 
-parseUidlist :: FilePath -> IO (Int, UID, Map Seq UID, Map UID FilePath)
+stripFlags :: String -> String
+stripFlags pth
+	| ':' `elem` pth = init $ dropWhileEnd (/=':') pth
+	| otherwise = pth
+	where
+	-- From newer base Data.List
+	dropWhileEnd p =
+		foldr (\x xs -> if p x && null xs then [] else x : xs) []
+
+parseUidlist :: FilePath -> IO (Int, UID, Map FilePath UID)
 parseUidlist mbox = do
 	uidlist <- fmap lines $ readFile (FP.joinPath [mbox,"uidlist"])
 	let header = words $ drop 2 (head uidlist)
-	let (seqs,uids) = unzip $ zipWith (\seq (uid:meta) ->
-			let nuid = read uid in
-				((Seq seq,UID nuid),(UID nuid,taggedItem ':' meta))
-		) [1..] (map words $ tail uidlist)
+	let uids = map ((\(uid:meta) ->
+			(stripFlags $ taggedItem ':' meta, read uid)
+		) . words) (tail uidlist)
 	return (
 			read $ taggedItem 'V' header,
-			UID $ read $ taggedItem 'N' header,
-			Map.fromAscList seqs,
-			Map.fromAscList uids
+			read $ taggedItem 'N' header,
+			Map.fromList uids
 		)
 
-writeUidlist :: (Int, UID, Map Seq UID, Map UID FilePath) -> FilePath -> IO (Int, UID, Map Seq UID, Map UID FilePath)
-writeUidlist (valid, UID nuid, seqs, uids) mbox = do
-	let (Seq mseq, _) = if Map.null seqs then (Seq 0, undefined) else
-		Map.findMax seqs
-	let nseq = mseq + 1
+writeUidlist :: (Int, UID, Map FilePath UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
+writeUidlist (valid, nuid, uids) mbox = do
+	-- Just move all new mail to cur with no flags
+	new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
+	mapM_ (\pth ->
+			let basename = FP.takeFileName pth
+			    flagname = stripFlags basename ++ ":2," in
+			renameFile pth (FP.joinPath [mbox, "cur", flagname])
+		) new
+
+	cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
+	let (nuid',unsorted) = foldl' (\(nuid,acc) m ->
+			let basename = FP.takeFileName m in
+			case Map.lookup (stripFlags basename) uids of
+				Just uid -> (nuid,(uid,basename):acc)
+				Nothing -> (succ nuid,(nuid,basename):acc)
+		) (nuid,[]) cur
+	let sorted = sortBy (comparing fst) unsorted
+
 	(tmpth, uidlst) <- openTempFile mbox "uidlist"
-	cur <- fmap (drop mseq) $
-		realDirectoryContents $ FP.joinPath [mbox, "cur"]
-	let next = nuid + length cur
 	-- Write header
-	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show next
-	-- Write existing content
-	mapM_ (\(UID uid,pth) ->
+	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show nuid'
+	-- Write content
+	mapM_ (\(uid,pth) ->
 			hPutStrLn uidlst (show uid ++ " :" ++ pth)
-		) (Map.toAscList uids)
-	-- Calculate and write new content
-	(nseqs,nuids) <- fmap unzip $ mapM (\(seq, uid, m) -> do
-			let basename = FP.takeFileName m
-			hPutStrLn uidlst (show uid ++ " :" ++ basename)
-			return ((Seq seq,UID uid),(UID seq,basename))
-		) (zip3 [nseq..] [nuid..] cur)
+		) sorted
 	hClose uidlst
+
 	renameFile tmpth (FP.joinPath [mbox,"uidlist"])
-	return (
-			valid,
-			UID next,
-			seqs `Map.union` Map.fromAscList nseqs,
-			uids `Map.union` Map.fromAscList nuids
-		)
+
+	return (valid, nuid', sorted)
 
 syncCall :: Chan b -> (Chan a -> b) -> IO a
 syncCall chan msg = do
@@ -231,12 +274,13 @@ wildcardMatch (p:ps) prefix (x:xs)
 	| p == x = wildcardMatch ps prefix xs
 	| otherwise = False
 
-data MessageSelector = SelectMessage Seq | SelectMessageRange Seq Seq
+data MessageSelector = SelectMessage SeqNum | SelectMessageRange SeqNum SeqNum
 	deriving (Eq)
 
 instance Show MessageSelector where
-	show (SelectMessage (Seq x)) = show x
-	show (SelectMessageRange (Seq s) (Seq e)) = show s ++ ":" ++ show e
+	show (SelectMessage (SeqNum x)) = show x
+	show (SelectMessageRange (SeqNum s) (SeqNum e)) =
+		show s ++ ":" ++ show e
 
 	showList ms t = intercalate "," (map show ms) ++ t
 
@@ -254,10 +298,10 @@ instance Read MessageSelector where
 				Just x -> [(SelectMessage x, rest)]
 				Nothing -> []
 		where
-		start = fmap (Seq . fst) $ safeHead $ reads start'
-		end = fmap (Seq . fst) $ safeHead $ reads $ tail end'
+		start = fmap (SeqNum . fst) $ safeHead $ reads start'
+		end = fmap (SeqNum . fst) $ safeHead $ reads $ tail end'
 		(start',end') = span (/=':') this
-		thisAsSeq = fmap (Seq . fst) $ safeHead $ reads this
+		thisAsSeq = fmap (SeqNum . fst) $ safeHead $ reads this
 		rest = safeTail rest'
 		(this,rest') = span (/=',') sel
 
@@ -267,12 +311,14 @@ instance Read MessageSelector where
 		Nothing -> [([],"")]
 
 -- Take return the items from the list as specified by MessageSelectoc
-selectMsgs :: [a] -> [MessageSelector] -> [a]
+selectMsgs :: Seq a -> [MessageSelector] -> [(SeqNum,a)]
 selectMsgs _ [] = []
-selectMsgs xs (SelectMessageRange (Seq s) (Seq e) : rest) =
-	take ((e-s)+1) (drop (s-1) xs) ++ selectMsgs xs rest
-selectMsgs xs (SelectMessage (Seq x) : rest) =
-	(xs !! (x-1)) : selectMsgs xs rest
+selectMsgs xs (SelectMessageRange s e : rest) =
+	let (s',e') = (fromEnum s, fromEnum e) in
+	zip [s..] (toList $ Seq.take (e'-s'+1) (Seq.drop s' xs)) ++
+		selectMsgs xs rest
+selectMsgs xs (SelectMessage x : rest) =
+	(x,Seq.index xs (fromEnum x)) : selectMsgs xs rest
 
 maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
 maildirFind fpred rpred mbox = FP.find
@@ -316,7 +362,7 @@ maybeErr msg Nothing = fail msg
 maybeErr _ (Just x) = return x
 
 stp :: Char -> Char -> String -> String
-stp lead trail [] = []
+stp _ _ [] = []
 stp lead trail (l:str) | l == lead = stpTrail str
                        | otherwise = stpTrail (l:str)
 	where
@@ -341,8 +387,8 @@ astring putS (('{':hd):_) = runErrorT $ do -- rest is garbage or []
 	return (bytes,[])
 astring _ (hd:rest) = runErrorT $ return (fromString hd, rest)
 
-stdinServer :: Chan BS.ByteString -> Chan UIDMsg -> FilePath -> Maybe FilePath -> IO ()
-stdinServer out uid maildir selected = do
+stdinServer :: Chan BS.ByteString -> Chan PthMsg -> FilePath -> Maybe FilePath -> IO ()
+stdinServer out getpth maildir selected = do
 	line <- fmap words getLine
 	hPutStrLn stderr (show (selected,line))
 	case line of
@@ -355,7 +401,7 @@ stdinServer out uid maildir selected = do
 	next selected
 	where
 	next sel = (hIsClosed stdin |/| hIsEOF stdin) >>=
-		(`when` stdinServer out uid maildir sel)
+		(`when` stdinServer out getpth maildir sel)
 	command tag "CAPABILITY" _ =
 		putS ("* CAPABILITY " ++ capabilities ++ "\r\n" ++
 			tag ++ " OK CAPABILITY completed\r\n")
@@ -380,13 +426,12 @@ stdinServer out uid maildir selected = do
 			let mbox' = if map toUpper mbox == "INBOX" then maildir else
 				FP.joinPath [maildir, mbox]
 			putS "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n"
-			cur <- realDirectoryContents $ FP.joinPath [mbox', "cur"]
-			new <- realDirectoryContents $ FP.joinPath [mbox', "new"]
-			putS $ "* " ++ show (length cur + length new) ++ " EXISTS\r\n"
-			putS $ "* " ++ show (length new) ++ " RECENT\r\n"
-			(Just uidvalidity) <- syncCall uid (UIDValidity mbox')
+			exists <- syncCall getpth (MsgCount mbox')
+			putS $ "* " ++ show exists ++ " EXISTS\r\n"
+			putS "* 0 RECENT\r\n" -- We move everything to cur
+			uidvalidity <- syncCall getpth (UIDValidity mbox')
 			putS $ "* OK [UIDVALIDITY " ++ show uidvalidity ++ "]\r\n"
-			(Just (UID uidnext)) <- syncCall uid (UIDNext mbox')
+			uidnext <- syncCall getpth (UIDNext mbox')
 			putS $ "* OK [UIDNEXT " ++ show uidnext ++ "]\r\n"
 			-- XXX: Read only because we have no writing commands yet
 			putS $ tag ++ " OK [READ-ONLY] SELECT completed\r\n"
@@ -421,31 +466,27 @@ stdinServer out uid maildir selected = do
 		case selected of
 			(Just mbox) ->
 				pastring args >>= handleErr tag (\(msgs,rest) -> do
-					cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
-					new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
-					let allm = zip [(1::Int)..] (cur ++ new)
 					-- If it was a literal, get more, strip ()
 					rest' <- fmap (words . map toUpper . stp '(' ')' . unwords)
 						(if null rest then fmap words getLine else return rest)
 					let selectors = nub ("UID" : squishBody rest')
 					let mselectors = read (toString msgs)
 					mselectors' <- if not useUID then return mselectors else
-						-- Convert UIDs to Seqs
+						-- Convert UIDs to SeqNums
 						mapM (\x -> case x of
-							(SelectMessage (Seq m)) ->
-								fmap (SelectMessage . fromJust) $
-								syncCall uid (SeqFromUID mbox (UID m))
-							(SelectMessageRange (Seq s) (Seq e)) ->
+							(SelectMessage (SeqNum m)) ->
+								fmap SelectMessage $
+								syncCall getpth (MsgSeq mbox (UID m))
+							(SelectMessageRange (SeqNum s) (SeqNum e)) ->
 								liftM2 SelectMessageRange
-								(fmap fromJust $
-									syncCall uid (SeqFromUID mbox (UID s)))
-								(fmap fromJust $
-									syncCall uid (SeqFromUID mbox (UID e)))
+								(syncCall getpth (MsgSeq mbox (UID s)))
+								(syncCall getpth (MsgSeq mbox (UID e)))
 						) mselectors
 
-					mapM_ (\(seq,pth) -> do
-							content <- unsafeInterleaveIO $ BS.readFile pth
-							muid <- syncCall uid (UIDFromSeq mbox (Seq seq))
+					allm <- syncCall getpth (MsgAll mbox)
+					mapM_ (\(SeqNum seq,(muid,pth)) -> do
+							content <- unsafeInterleaveIO $
+								BS.readFile $ FP.joinPath [mbox, "cur", pth]
 							let m = MIME.parse $ toString content
 							let f = fromString $ unwords ["*",show seq,"FETCH ("]
 							let b = fromString ")\r\n"
@@ -459,8 +500,7 @@ stdinServer out uid maildir selected = do
 					putS (tag ++ " OK fetch complete\r\n")
 				)
 			Nothing -> putS (tag ++ " NO select mailbox\r\n")
-	fetch "UID" (Just (UID id)) _ _ _ = fromString $ show id
-	fetch "UID" Nothing _ _ _ = error "TODO: add message to UIDs"
+	fetch "UID" uid _ _ _ = fromString $ show uid
 	fetch "INTERNALDATE" _ _ _ m = fromString $
 		strftime "\"%d-%b-%Y %H:%M:%S %z\"" $ fullDate2UTCTime $
 			fromMaybe MIME.epochDate $ -- epoch if no Date header
