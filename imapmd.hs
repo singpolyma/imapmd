@@ -4,22 +4,22 @@ import Data.Char (toUpper,toLower)
 import Data.List
 import Data.Time
 import Data.Maybe
-import Data.Foldable (toList)
 import Control.Arrow (first)
 import Control.Monad
 import Control.Monad.Error
-import Control.Exception (catch, BlockedIndefinitelyOnMVar(..), SomeException(..))
+import Control.Exception (catch, finally, SomeException(..))
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Chan
 import System (getArgs)
 import System.IO
 import System.IO.Unsafe (unsafeInterleaveIO)
+import System.INotify
 import System.Locale (defaultTimeLocale)
 import System.Directory
 import Data.ByteString.UTF8 (fromString, toString)
 import Numeric.Search.Range (searchFromTo)
-import Data.Sequence (Seq)
-import qualified Data.Sequence as Seq
+import Data.Vector (Vector)
+import qualified Data.Vector as Vector
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString as BS
@@ -83,10 +83,9 @@ main = do
 	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
 	stdoutChan <- newChan
 	pthChan <- newChan
-	stdinServer stdoutChan pthChan maildir Nothing <|*|>
-		pthServer maildir pthChan <|*|>
-		(stdoutServer stdoutChan
-			`catch` (\BlockedIndefinitelyOnMVar -> return ()))
+	pthServer maildir pthChan <|*|> stdoutServer stdoutChan <|*|>
+		stdinServer stdoutChan pthChan maildir Nothing
+			`finally` syncCall pthChan MsgFlush
 
 binHandle :: Handle -> IO Handle
 binHandle handle = do
@@ -126,57 +125,96 @@ instance Enum SeqNum where
 	toEnum i = SeqNum (i+1)
 
 data PthMsg =
-	MsgAll FilePath (Chan (Seq (UID,FilePath))) |
+	MsgAll FilePath (Chan (Vector (UID,FilePath))) |
 	MsgCount FilePath (Chan Int) |
 	MsgPath FilePath SeqNum (Chan FilePath) |
 	MsgUID FilePath SeqNum (Chan UID) |
 	MsgSeq FilePath UID (Chan SeqNum) |
 	UIDValidity FilePath (Chan Int) |
-	UIDNext FilePath (Chan UID)
+	UIDNext FilePath (Chan UID) |
+	MsgNew FilePath FilePath |
+	MsgDel FilePath FilePath |
+	MsgFlush (Chan ())
 
 pthServer :: FilePath -> Chan PthMsg -> IO ()
-pthServer root chan = do
-	mboxes <- maildirFind (const True) (const True) root >>=
-		filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
-	maps <- mapM (\mbox -> do
-			exist <- doesFileExist (FP.joinPath [mbox,"uidlist"])
-			time <- fmap (strftime "%s") getCurrentTime
-			ms <- if exist then parseUidlist mbox else
-				return (read time, UID 1, Map.empty)
-			(valid,nuid,sorted) <- writeUidlist ms mbox
-			return (mbox, (valid,nuid,Seq.fromList sorted))
-		) mboxes
-	pthServer' (Map.fromList maps)
+pthServer root chan = withINotify (\inotify -> do
+		mboxes <- maildirFind (const True) (const True) root >>=
+			filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
+		maps <- mapM (\mbox -> do
+				exist <- doesFileExist (FP.joinPath [mbox,"uidlist"])
+				time <- fmap (strftime "%s") getCurrentTime
+				ms <- if exist then parseUidlist mbox else
+					return (read time, UID 1, Map.empty)
+				(valid,nuid,sorted) <- updateUidlist ms mbox
+				let cur = FP.joinPath [mbox, "cur"]
+				_ <- addWatch inotify
+					[Create,MoveIn,Delete] cur (handleINotify mbox)
+				return (mbox, (valid,nuid,Vector.fromList sorted))
+			) mboxes
+		pthServer' (0::Int) (Map.fromList maps)
+	)
 	where
-	pthServer' maps = do
+	handleINotify mbox (Created { isDirectory = False, filePath = pth }) =
+		writeChan chan (MsgNew mbox pth)
+	handleINotify mbox (MovedIn { isDirectory = False, filePath = pth }) =
+		writeChan chan (MsgNew mbox pth)
+	handleINotify mbox (Deleted { filePath = pth }) =
+		writeChan chan (MsgDel mbox pth)
+	handleINotify _ _ = return () -- Ignore other events
+	pthServer' updateCounterIn maps = do
+		updateCounter <- if updateCounterIn < 10 then
+				return updateCounterIn
+			else
+				-- Flush uidlists on background thread
+				-- XXX: Should we keep track of which are dirty?
+				(rewriteUidlists maps <|*|> return ()) >> return 0
 		msg <- readChan chan
 		case msg of
 			(MsgAll mbox r) -> writeChan r (trd3 $ getMbox mbox maps)
 			(MsgCount mbox r) -> writeChan r $
-				Seq.length $ trd3 $ getMbox mbox maps
+				Vector.length $ trd3 $ getMbox mbox maps
 			(MsgUID mbox s r) -> writeChan r $
-				fst $ Seq.index (trd3 $ getMbox mbox maps) (fromEnum s)
+				fst $ (Vector.!) (trd3 $ getMbox mbox maps) (fromEnum s)
 			(MsgSeq mbox uid r) -> writeChan r $
 				case findUID (trd3 $ getMbox mbox maps) uid of
 					Just i -> toEnum i
 					Nothing -> error ("UID " ++ show uid ++ "out of range")
 			(MsgPath mbox s r) -> writeChan r $
-				snd $ Seq.index (trd3 $ getMbox mbox maps) (fromEnum s)
+				snd $ (Vector.!) (trd3 $ getMbox mbox maps) (fromEnum s)
 			(UIDValidity mbox r) ->
 				writeChan r (fst3 $ getMbox mbox maps)
 			(UIDNext mbox r) ->
 				writeChan r (snd3 $ getMbox mbox maps)
-		pthServer' maps
+			(MsgNew mbox pth) ->
+				-- If we already know about the unique part of this path,
+				-- it is a rename. Else it is a new message
+				let u = stripFlags pth in
+				pthServer' (succ updateCounter) $ Map.adjust (\(v,n,m) ->
+					case Vector.findIndex (\(_,mp) -> u == stripFlags mp) m of
+						Just i ->
+							(v,n,(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
+						Nothing -> (v, succ n, Vector.snoc m (n,pth))
+				) mbox maps
+			(MsgDel mbox pth) ->
+				pthServer' (succ updateCounter) $ Map.adjust (\(v,n,m) ->
+					let (l,a) = Vector.break (\(_,fp) -> fp == pth) m in
+					(v, n, (Vector.++) l (Vector.tail a))
+				) mbox maps
+			MsgFlush r -> rewriteUidlists maps >> writeChan r ()
+		pthServer' updateCounter maps
 	fst3 (v,_,_) = v
 	snd3 (_,n,_) = n
 	trd3 (_,_,m) = m
 	getMbox mbox maps = fromMaybe (error ("No mailbox " ++ mbox)) $
 		Map.lookup mbox maps
 	findUID sequence uid = do
-		let (l,h) = (0, Seq.length sequence - 1)
-		k <- searchFromTo (\i -> fst (Seq.index sequence i) >= uid) l h
-		guard (fst (Seq.index sequence k) == uid)
+		let (l,h) = (0, Vector.length sequence - 1)
+		k <- searchFromTo (\i -> fst ((Vector.!) sequence i) >= uid) l h
+		guard (fst ((Vector.!) sequence k) == uid)
 		return k
+	rewriteUidlists maps = mapM_ (\(mbox,(v,n,m)) ->
+			writeUidlist (v,n,Vector.toList m) mbox
+		) (Map.toList maps)
 
 taggedItem :: Char -> [String] -> String
 taggedItem _ [] = error "No such item"
@@ -205,8 +243,8 @@ parseUidlist mbox = do
 			Map.fromList uids
 		)
 
-writeUidlist :: (Int, UID, Map FilePath UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
-writeUidlist (valid, nuid, uids) mbox = do
+updateUidlist :: (Int, UID, Map FilePath UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
+updateUidlist (valid, nuid, uids) mbox = do
 	-- Just move all new mail to cur with no flags
 	new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
 	mapM_ (\pth ->
@@ -224,18 +262,22 @@ writeUidlist (valid, nuid, uids) mbox = do
 		) (nuid,[]) cur
 	let sorted = sortBy (comparing fst) unsorted
 
+	writeUidlist (valid, nuid', sorted) mbox
+	return (valid, nuid', sorted)
+
+-- WARNING: this functino *must only* be called on a sorted list!
+writeUidlist :: (Int, UID, [(UID,FilePath)]) -> FilePath -> IO ()
+writeUidlist (valid, nuid, sorted) mbox = do
 	(tmpth, uidlst) <- openTempFile mbox "uidlist"
 	-- Write header
-	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show nuid'
+	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show nuid
 	-- Write content
 	mapM_ (\(uid,pth) ->
 			hPutStrLn uidlst (show uid ++ " :" ++ pth)
 		) sorted
+
 	hClose uidlst
-
 	renameFile tmpth (FP.joinPath [mbox,"uidlist"])
-
-	return (valid, nuid', sorted)
 
 syncCall :: Chan b -> (Chan a -> b) -> IO a
 syncCall chan msg = do
@@ -311,14 +353,14 @@ instance Read MessageSelector where
 		Nothing -> [([],"")]
 
 -- Take return the items from the list as specified by MessageSelectoc
-selectMsgs :: Seq a -> [MessageSelector] -> [(SeqNum,a)]
+selectMsgs :: Vector a -> [MessageSelector] -> [(SeqNum,a)]
 selectMsgs _ [] = []
 selectMsgs xs (SelectMessageRange s e : rest) =
 	let (s',e') = (fromEnum s, fromEnum e) in
-	zip [s..] (toList $ Seq.take (e'-s'+1) (Seq.drop s' xs)) ++
+	zip [s..] (Vector.toList $ Vector.slice s' (e'-s'+1) xs) ++
 		selectMsgs xs rest
 selectMsgs xs (SelectMessage x : rest) =
-	(x,Seq.index xs (fromEnum x)) : selectMsgs xs rest
+	(x,(Vector.!) xs (fromEnum x)) : selectMsgs xs rest
 
 maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
 maildirFind fpred rpred mbox = FP.find
@@ -408,7 +450,7 @@ stdinServer out getpth maildir selected = do
 	command tag "NOOP" _ = noop tag
 	command tag "CHECK" _ = noop tag
 	command tag "LOGOUT" _ = do
-		putS ("* BYE logout\r\n" ++ tag ++ " OK LOGOUT completed\r\n")
+		putStr $ "* BYE logout\r\n" ++ tag ++ " OK LOGOUT completed\r\n"
 		hClose stdin
 	-- If the client was expecting to need to send more data
 	-- it may get confused when we just say "OK"
