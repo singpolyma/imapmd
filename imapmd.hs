@@ -484,6 +484,7 @@ stdinServer out getpth maildir selected = do
 						pastring =<< fmap words getLine
 				_ -> handleErr tag (list tag arg1) =<< pastring args
 		)
+	command tag "LSUB" _ = noop tag -- XXX: We don't support subs
 	command tag "SELECT" args =
 		pastring args >>= handleErr tag (\arg1 -> do
 			let mbox = toString $ fst arg1
