@@ -316,13 +316,32 @@ wildcardMatch (p:ps) prefix (x:xs)
 	| p == x = wildcardMatch ps prefix xs
 	| otherwise = False
 
-data MessageSelector = SelectMessage SeqNum | SelectMessageRange SeqNum SeqNum
+data SelectNum = SelectNum Int | SelectNumStar deriving (Eq)
+
+-- WARNING: only call this on proper sequence numbers
+selectToSeq :: SelectNum -> SeqNum -> SeqNum
+selectToSeq (SelectNum i) _ = SeqNum i
+selectToSeq SelectNumStar highest = highest
+
+instance Read SelectNum where
+	readsPrec _ ('*':s) = [(SelectNumStar,s)]
+	readsPrec i s = map (first SelectNum) (readsPrec i s)
+
+data MessageSelector =
+	SelectMessage SelectNum | SelectMessageRange SelectNum SelectNum
 	deriving (Eq)
 
 instance Show MessageSelector where
-	show (SelectMessage (SeqNum x)) = show x
-	show (SelectMessageRange (SeqNum s) (SeqNum e)) =
+	show (SelectMessage (SelectNum x)) = show x
+	show (SelectMessage SelectNumStar) = "*"
+	show (SelectMessageRange (SelectNum s) (SelectNum e)) =
 		show s ++ ":" ++ show e
+	show (SelectMessageRange (SelectNum s) SelectNumStar) =
+		show s ++ ":*"
+	show (SelectMessageRange SelectNumStar (SelectNum e)) =
+		"*:" ++ show e
+	show (SelectMessageRange SelectNumStar SelectNumStar) =
+		"*:*"
 
 	showList ms t = intercalate "," (map show ms) ++ t
 
@@ -336,14 +355,14 @@ instance Read MessageSelector where
 					[(SelectMessageRange s e, rest)]
 				_ -> []
 		| otherwise =
-			case thisAsSeq of
+			case thisAsN of
 				Just x -> [(SelectMessage x, rest)]
 				Nothing -> []
 		where
-		start = fmap (SeqNum . fst) $ safeHead $ reads start'
-		end = fmap (SeqNum . fst) $ safeHead $ reads $ tail end'
+		start = fmap fst $ safeHead $ reads start'
+		end = fmap fst $ safeHead $ reads $ tail end'
 		(start',end') = span (/=':') this
-		thisAsSeq = fmap (SeqNum . fst) $ safeHead $ reads this
+		thisAsN = fmap fst $ safeHead $ reads this
 		rest = safeTail rest'
 		(this,rest') = span (/=',') sel
 
@@ -352,15 +371,18 @@ instance Read MessageSelector where
 		Just (s,rest) -> [(s : fst (head $ readList rest), "")]
 		Nothing -> [([],"")]
 
--- Take return the items from the list as specified by MessageSelectoc
+-- Take the items from the list as specified by MessageSelector
 selectMsgs :: Vector a -> [MessageSelector] -> [(SeqNum,a)]
 selectMsgs _ [] = []
 selectMsgs xs (SelectMessageRange s e : rest) =
-	let (s',e') = (fromEnum s, fromEnum e) in
-	zip [s..] (Vector.toList $ Vector.slice s' (e'-s'+1) xs) ++
+	let highest = toEnum $ Vector.length xs - 1
+	    (start, end) = (selectToSeq s highest, selectToSeq e highest)
+	    (s',e') = (fromEnum start, fromEnum end) in
+	zip [start..] (Vector.toList $ Vector.slice s' (e'-s'+1) xs) ++
 		selectMsgs xs rest
 selectMsgs xs (SelectMessage x : rest) =
-	(x,(Vector.!) xs (fromEnum x)) : selectMsgs xs rest
+	let x' = selectToSeq x (toEnum $ Vector.length xs - 1) in
+	(x',(Vector.!) xs (fromEnum x')) : selectMsgs xs rest
 
 maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
 maildirFind fpred rpred mbox = FP.find
@@ -514,15 +536,27 @@ stdinServer out getpth maildir selected = do
 					let selectors = nub ("UID" : squishBody rest')
 					let mselectors = read (toString msgs)
 					mselectors' <- if not useUID then return mselectors else
+						let sq2sl (SeqNum i) = SelectNum i in
 						-- Convert UIDs to SeqNums
 						mapM (\x -> case x of
-							(SelectMessage (SeqNum m)) ->
-								fmap SelectMessage $
+							(SelectMessage (SelectNum m)) ->
+								fmap (SelectMessage . sq2sl) $
 								syncCall getpth (MsgSeq mbox (UID m))
-							(SelectMessageRange (SeqNum s) (SeqNum e)) ->
+							(SelectMessageRange (SelectNum s) (SelectNum e)) ->
 								liftM2 SelectMessageRange
-								(syncCall getpth (MsgSeq mbox (UID s)))
-								(syncCall getpth (MsgSeq mbox (UID e)))
+								(fmap sq2sl $
+									syncCall getpth (MsgSeq mbox (UID s)))
+								(fmap sq2sl $
+									syncCall getpth (MsgSeq mbox (UID e)))
+							(SelectMessageRange (SelectNum s) SelectNumStar) ->
+								fmap (`SelectMessageRange` SelectNumStar)
+								(fmap sq2sl $
+									syncCall getpth (MsgSeq mbox (UID s)))
+							(SelectMessageRange SelectNumStar (SelectNum e)) ->
+								fmap (SelectMessageRange SelectNumStar)
+								(fmap sq2sl $
+									syncCall getpth (MsgSeq mbox (UID e)))
+							_ -> return x
 						) mselectors
 
 					allm <- syncCall getpth (MsgAll mbox)
