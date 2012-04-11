@@ -472,7 +472,7 @@ stdinServer out getpth maildir selected = do
 	command tag "NOOP" _ = noop tag
 	command tag "CHECK" _ = noop tag
 	command tag "LOGOUT" _ = do
-		putStr $ "* BYE logout\r\n" ++ tag ++ " OK LOGOUT completed\r\n"
+		putS $ "* BYE logout\r\n" ++ tag ++ " OK LOGOUT completed\r\n"
 		hClose stdin
 	-- If the client was expecting to need to send more data
 	-- it may get confused when we just say "OK"
