@@ -1,2 +1,3 @@
 STATUS command
 SEARCH command (start with just ALL, for Modest)
+BUG: notify client of deletions and flag changes and new messages, right now all the client's sequence numbers during the session may be off
