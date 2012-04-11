@@ -129,7 +129,7 @@ data PthMsg =
 	MsgCount FilePath (Chan Int) |
 	MsgPath FilePath SeqNum (Chan FilePath) |
 	MsgUID FilePath SeqNum (Chan UID) |
-	MsgSeq FilePath UID (Chan SeqNum) |
+	MsgSeq FilePath UID Bool (Chan SeqNum) |
 	UIDValidity FilePath (Chan Int) |
 	UIDNext FilePath (Chan UID) |
 	MsgNew FilePath FilePath |
@@ -175,8 +175,8 @@ pthServer root chan = withINotify (\inotify -> do
 				Vector.length $ trd3 $ getMbox mbox maps
 			(MsgUID mbox s r) -> writeChan r $
 				fst $ (Vector.!) (trd3 $ getMbox mbox maps) (fromEnum s)
-			(MsgSeq mbox uid r) -> writeChan r $
-				case findUID (trd3 $ getMbox mbox maps) uid of
+			(MsgSeq mbox uid fuzzy r) -> writeChan r $
+				case findUID fuzzy (trd3 $ getMbox mbox maps) uid of
 					Just i -> toEnum i
 					Nothing -> error ("UID " ++ show uid ++ "out of range")
 			(MsgPath mbox s r) -> writeChan r $
@@ -207,10 +207,10 @@ pthServer root chan = withINotify (\inotify -> do
 	trd3 (_,_,m) = m
 	getMbox mbox maps = fromMaybe (error ("No mailbox " ++ mbox)) $
 		Map.lookup mbox maps
-	findUID sequence uid = do
+	findUID fuzzy sequence uid = do
 		let (l,h) = (0, Vector.length sequence - 1)
 		k <- searchFromTo (\i -> fst ((Vector.!) sequence i) >= uid) l h
-		guard (fst ((Vector.!) sequence k) == uid)
+		guard (fuzzy || fst ((Vector.!) sequence k) == uid)
 		return k
 	rewriteUidlists maps = mapM_ (\(mbox,(v,n,m)) ->
 			writeUidlist (v,n,Vector.toList m) mbox
@@ -542,21 +542,21 @@ stdinServer out getpth maildir selected = do
 						mapM (\x -> case x of
 							(SelectMessage (SelectNum m)) ->
 								fmap (SelectMessage . sq2sl) $
-								syncCall getpth (MsgSeq mbox (UID m))
+								syncCall getpth (MsgSeq mbox (UID m) False)
 							(SelectMessageRange (SelectNum s) (SelectNum e)) ->
 								liftM2 SelectMessageRange
 								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID s)))
+									syncCall getpth (MsgSeq mbox (UID s) True))
 								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID e)))
+									syncCall getpth (MsgSeq mbox (UID e) True))
 							(SelectMessageRange (SelectNum s) SelectNumStar) ->
 								fmap (`SelectMessageRange` SelectNumStar)
 								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID s)))
+									syncCall getpth (MsgSeq mbox (UID s) True))
 							(SelectMessageRange SelectNumStar (SelectNum e)) ->
 								fmap (SelectMessageRange SelectNumStar)
 								(fmap sq2sl $
-									syncCall getpth (MsgSeq mbox (UID e)))
+									syncCall getpth (MsgSeq mbox (UID e) True))
 							_ -> return x
 						) mselectors
 
