@@ -31,6 +31,8 @@ import qualified System.FilePath.FilePather.RecursePredicate as FP
 import qualified Codec.MIME.String as MIME
 import qualified System.Posix.FileLock as FL
 
+-- Some utilities to get useful dates from Codec.MIME.String
+
 months :: [MIME.Month]
 months = [MIME.Jan, MIME.Feb, MIME.Mar, MIME.Apr, MIME.May, MIME.Jun, MIME.Jul, MIME.Aug, MIME.Sep, MIME.Oct, MIME.Nov, MIME.Dec]
 
@@ -49,13 +51,6 @@ instance Enum MIME.Month where
 	fromEnum MIME.Dec = 12
 	toEnum x = months !! (x - 1)
 
--- Run in background
-forkIO_ :: IO a -> IO ()
-forkIO_ x = forkIO (x >> return ()) >> return ()
-
-strftime :: (FormatTime t) => String -> t -> String
-strftime = formatTime defaultTimeLocale
-
 fullDate2UTCTime :: MIME.FullDate -> UTCTime
 fullDate2UTCTime (MIME.FullDate _
 	(MIME.Date day month year)
@@ -64,6 +59,15 @@ fullDate2UTCTime (MIME.FullDate _
 		UTCTime (fromGregorian (toInteger year) (fromEnum month) day)
 			(secondsToDiffTime $ toInteger $
 				(60*60*(hour+timezone)) + (60*minute) + second)
+
+-- Other utilities
+
+-- Run in background
+forkIO_ :: IO a -> IO ()
+forkIO_ x = forkIO (x >> return ()) >> return ()
+
+strftime :: (FormatTime t) => String -> t -> String
+strftime = formatTime defaultTimeLocale
 
 realDirectoryContents :: FilePath -> IO [FilePath]
 realDirectoryContents path = (map (\p -> FP.joinPath [path,p]) .
@@ -78,23 +82,6 @@ drainChan chan = do
 		rest <- drainChan chan
 		return (v : rest)
 
-capabilities :: String
-capabilities = "IMAP4rev1"
-
-main :: IO ()
-main = do
-	maildir <- (fromMaybe (error "No Maildir specified") . safeHead)
-		`fmap` getArgs
-	_ <- txtHandle stdin -- stdin is text for commands, may switch
-	_ <- binHandle stdout
-	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
-	stdoutChan <- newChan
-	pthChan <- newChan
-	forkIO_ $ pthServer maildir pthChan stdoutChan
-	forkIO_ $ stdoutServer stdoutChan
-	stdinServer stdoutChan pthChan maildir Nothing
-		`finally` syncCall pthChan MsgFinish -- Ensure pthServer is done
-
 binHandle :: Handle -> IO Handle
 binHandle handle = do
 	hSetBinaryMode handle True
@@ -108,12 +95,67 @@ txtHandle handle = do
 	hSetBuffering handle LineBuffering
 	return handle
 
-stdoutServer :: Chan BS.ByteString -> IO ()
-stdoutServer chan = forever $ do
-	bytes <- readChan chan
-	BS.putStr bytes
+taggedItem :: Char -> [String] -> String
+taggedItem _ [] = error "No such item"
+taggedItem c ((t:r):_) | t == c = r
+taggedItem c (_:ws) = taggedItem c ws
 
--- Sequence numbers and UIDs both start from 1, but indices start from 0
+stripFlags :: String -> String
+stripFlags pth
+	| ':' `elem` pth = init $ dropWhileEnd (/=':') pth
+	| otherwise = pth
+	where
+	-- From newer base Data.List
+	dropWhileEnd p =
+		foldr (\x xs -> if p x && null xs then [] else x : xs) []
+
+getFlags :: String -> [String]
+getFlags pth =
+	foldr (\f acc -> case f of
+		'R' -> "\\Answered" : acc
+		'S' -> "\\Seen" : acc
+		'T' -> "\\Deleted" : acc
+		'D' -> "\\Draft" : acc
+		'F' -> "\\Flagged" : acc
+		_ -> acc
+	) [] (takeWhile (/=':') $ reverse pth)
+
+syncCall :: Chan b -> (Chan a -> b) -> IO a
+syncCall chan msg = do
+	r <- newChan
+	writeChan chan (msg r)
+	readChan r
+
+-- (not `oo` (||)) for IO
+(|/|) :: IO Bool -> IO Bool -> IO Bool
+x |/| y = do
+	xv <- x
+	if xv then return False else fmap not y
+
+safeTail :: [a] -> [a]
+safeTail [] = []
+safeTail (_:tl) = tl
+
+safeHead :: [a] -> Maybe a
+safeHead [] = Nothing
+safeHead (x:_) = Just x
+
+maybeErr :: (Monad m) => String -> Maybe a -> m a
+maybeErr msg Nothing = fail msg
+maybeErr _ (Just x) = return x
+
+stp :: Char -> Char -> String -> String
+stp _ _ [] = []
+stp lead trail (l:str) | l == lead = stpTrail str
+                       | otherwise = stpTrail (l:str)
+	where
+	stpTrail [] = []
+	stpTrail s | last s == trail = init s
+	stpTrail s = s
+
+-- Sequence numbers, UIDs, and ranges
+-- SeqNum and UID are numbers from 1, but we use them as indexes from 0
+
 newtype UID = UID Int deriving (Eq, Ord)
 
 instance Enum UID where
@@ -132,6 +174,63 @@ instance Enum SeqNum where
 	fromEnum (SeqNum i) = i-1
 	toEnum i = SeqNum (i+1)
 
+data SelectNum = SelectNum Int | SelectNumStar deriving (Eq)
+
+instance Read SelectNum where
+	readsPrec _ ('*':s) = [(SelectNumStar,s)]
+	readsPrec i s = map (first SelectNum) (readsPrec i s)
+
+data MessageSelector =
+	SelectMessage SelectNum | SelectMessageRange SelectNum SelectNum
+	deriving (Eq)
+
+instance Show MessageSelector where
+	show (SelectMessage (SelectNum x)) = show x
+	show (SelectMessage SelectNumStar) = "*"
+	show (SelectMessageRange (SelectNum s) (SelectNum e)) =
+		show s ++ ":" ++ show e
+	show (SelectMessageRange (SelectNum s) SelectNumStar) =
+		show s ++ ":*"
+	show (SelectMessageRange SelectNumStar (SelectNum e)) =
+		"*:" ++ show e
+	show (SelectMessageRange SelectNumStar SelectNumStar) =
+		"*:*"
+
+	showList ms t = intercalate "," (map show ms) ++ t
+
+instance Read MessageSelector where
+	-- Parse 1,5:12,6 into [1, 5-12, 6]
+	-- Currently pancakes errors, this may not be the desired behaviour
+	readsPrec _ sel
+		| ':' `elem` this =
+			case (start,end) of
+				(Just s, Just e) ->
+					[(SelectMessageRange s e, rest)]
+				_ -> []
+		| otherwise =
+			case thisAsN of
+				Just x -> [(SelectMessage x, rest)]
+				Nothing -> []
+		where
+		start = fmap fst $ safeHead $ reads start'
+		end = fmap fst $ safeHead $ reads $ tail end'
+		(start',end') = span (/=':') this
+		thisAsN = fmap fst $ safeHead $ reads this
+		rest = safeTail rest'
+		(this,rest') = span (/=',') sel
+
+	readList "" = [([],"")]
+	readList sel = case safeHead $ reads sel of
+		Just (s,rest) -> [(s : fst (head $ readList rest), "")]
+		Nothing -> [([],"")]
+
+-- WARNING: only call this on proper sequence numbers
+selectToSeq :: SelectNum -> SeqNum -> SeqNum
+selectToSeq (SelectNum i) _ = SeqNum i
+selectToSeq SelectNumStar highest = highest
+
+-- Path Server manages SeqNum <-> UID <-> FilePath mappings
+
 data PthMsg =
 	MsgAll FilePath (Chan (Vector (UID,FilePath))) |
 	MsgCount FilePath (Chan Int) |
@@ -144,6 +243,55 @@ data PthMsg =
 	MsgNew FilePath FilePath |
 	MsgDelFlush (Chan ()) |
 	MsgFinish (Chan ())
+
+parseUidlist :: FilePath -> IO (Int, UID, Map FilePath UID)
+parseUidlist mbox = do
+	uidlist <- fmap lines $ readFile (FP.joinPath [mbox,"uidlist"])
+	let header = words $ drop 2 (head uidlist)
+	let uids = map ((\(uid:meta) ->
+			(stripFlags $ taggedItem ':' meta, read uid)
+		) . words) (tail uidlist)
+	return (
+			read $ taggedItem 'V' header,
+			read $ taggedItem 'N' header,
+			Map.fromList uids
+		)
+
+updateUidlist :: (Int, UID, Map FilePath UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
+updateUidlist (valid, nuid, uids) mbox = do
+	-- Just move all new mail to cur with no flags
+	new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
+	mapM_ (\pth ->
+			let basename = FP.takeFileName pth
+			    flagname = stripFlags basename ++ ":2," in
+			renameFile pth (FP.joinPath [mbox, "cur", flagname])
+		) new
+
+	cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
+	let (nuid',unsorted) = foldl' (\(nuid,acc) m ->
+			let basename = FP.takeFileName m in
+			case Map.lookup (stripFlags basename) uids of
+				Just uid -> (nuid,(uid,basename):acc)
+				Nothing -> (succ nuid,(nuid,basename):acc)
+		) (nuid,[]) cur
+	let sorted = sortBy (comparing fst) unsorted
+
+	writeUidlist (valid, nuid', sorted) mbox
+	return (valid, nuid', sorted)
+
+-- WARNING: this function must *only* be called on a sorted list!
+writeUidlist :: (Int, UID, [(UID,FilePath)]) -> FilePath -> IO ()
+writeUidlist (valid, nuid, sorted) mbox = do
+	(tmpth, uidlst) <- openTempFile mbox "uidlist"
+	-- Write header
+	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show nuid
+	-- Write content
+	mapM_ (\(uid,pth) ->
+			hPutStrLn uidlst (show uid ++ " :" ++ pth)
+		) sorted
+
+	hClose uidlst
+	renameFile tmpth (FP.joinPath [mbox,"uidlist"])
 
 pthServer :: FilePath -> Chan PthMsg -> Chan BS.ByteString -> IO ()
 pthServer root chan stdoutChan = withINotify (\inotify -> do
@@ -251,91 +399,7 @@ pthServer root chan stdoutChan = withINotify (\inotify -> do
 	rewriteUidlists maps =
 		mapM_ (uncurry writeUidlistWithLock) (Map.toList maps)
 
-taggedItem :: Char -> [String] -> String
-taggedItem _ [] = error "No such item"
-taggedItem c ((t:r):_) | t == c = r
-taggedItem c (_:ws) = taggedItem c ws
-
-stripFlags :: String -> String
-stripFlags pth
-	| ':' `elem` pth = init $ dropWhileEnd (/=':') pth
-	| otherwise = pth
-	where
-	-- From newer base Data.List
-	dropWhileEnd p =
-		foldr (\x xs -> if p x && null xs then [] else x : xs) []
-
-getFlags :: String -> [String]
-getFlags pth =
-	foldr (\f acc -> case f of
-		'R' -> "\\Answered" : acc
-		'S' -> "\\Seen" : acc
-		'T' -> "\\Deleted" : acc
-		'D' -> "\\Draft" : acc
-		'F' -> "\\Flagged" : acc
-		_ -> acc
-	) [] (takeWhile (/=':') $ reverse pth)
-
-parseUidlist :: FilePath -> IO (Int, UID, Map FilePath UID)
-parseUidlist mbox = do
-	uidlist <- fmap lines $ readFile (FP.joinPath [mbox,"uidlist"])
-	let header = words $ drop 2 (head uidlist)
-	let uids = map ((\(uid:meta) ->
-			(stripFlags $ taggedItem ':' meta, read uid)
-		) . words) (tail uidlist)
-	return (
-			read $ taggedItem 'V' header,
-			read $ taggedItem 'N' header,
-			Map.fromList uids
-		)
-
-updateUidlist :: (Int, UID, Map FilePath UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
-updateUidlist (valid, nuid, uids) mbox = do
-	-- Just move all new mail to cur with no flags
-	new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
-	mapM_ (\pth ->
-			let basename = FP.takeFileName pth
-			    flagname = stripFlags basename ++ ":2," in
-			renameFile pth (FP.joinPath [mbox, "cur", flagname])
-		) new
-
-	cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
-	let (nuid',unsorted) = foldl' (\(nuid,acc) m ->
-			let basename = FP.takeFileName m in
-			case Map.lookup (stripFlags basename) uids of
-				Just uid -> (nuid,(uid,basename):acc)
-				Nothing -> (succ nuid,(nuid,basename):acc)
-		) (nuid,[]) cur
-	let sorted = sortBy (comparing fst) unsorted
-
-	writeUidlist (valid, nuid', sorted) mbox
-	return (valid, nuid', sorted)
-
--- WARNING: this functino *must only* be called on a sorted list!
-writeUidlist :: (Int, UID, [(UID,FilePath)]) -> FilePath -> IO ()
-writeUidlist (valid, nuid, sorted) mbox = do
-	(tmpth, uidlst) <- openTempFile mbox "uidlist"
-	-- Write header
-	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show nuid
-	-- Write content
-	mapM_ (\(uid,pth) ->
-			hPutStrLn uidlst (show uid ++ " :" ++ pth)
-		) sorted
-
-	hClose uidlst
-	renameFile tmpth (FP.joinPath [mbox,"uidlist"])
-
-syncCall :: Chan b -> (Chan a -> b) -> IO a
-syncCall chan msg = do
-	r <- newChan
-	writeChan chan (msg r)
-	readChan r
-
--- not `oo` (||) for IO
-(|/|) :: IO Bool -> IO Bool -> IO Bool
-x |/| y = do
-	xv <- x
-	if xv then return False else fmap not y
+-- stdinServer handles the incoming IMAP commands
 
 token :: (Eq a) => a -> a -> [a] -> ([a], [a])
 token _ _ [] = ([],[]) -- Should this be an error?
@@ -361,61 +425,6 @@ wildcardMatch ("*":ps) prefix xs =
 wildcardMatch (p:ps) prefix (x:xs)
 	| p == x = wildcardMatch ps prefix xs
 	| otherwise = False
-
-data SelectNum = SelectNum Int | SelectNumStar deriving (Eq)
-
--- WARNING: only call this on proper sequence numbers
-selectToSeq :: SelectNum -> SeqNum -> SeqNum
-selectToSeq (SelectNum i) _ = SeqNum i
-selectToSeq SelectNumStar highest = highest
-
-instance Read SelectNum where
-	readsPrec _ ('*':s) = [(SelectNumStar,s)]
-	readsPrec i s = map (first SelectNum) (readsPrec i s)
-
-data MessageSelector =
-	SelectMessage SelectNum | SelectMessageRange SelectNum SelectNum
-	deriving (Eq)
-
-instance Show MessageSelector where
-	show (SelectMessage (SelectNum x)) = show x
-	show (SelectMessage SelectNumStar) = "*"
-	show (SelectMessageRange (SelectNum s) (SelectNum e)) =
-		show s ++ ":" ++ show e
-	show (SelectMessageRange (SelectNum s) SelectNumStar) =
-		show s ++ ":*"
-	show (SelectMessageRange SelectNumStar (SelectNum e)) =
-		"*:" ++ show e
-	show (SelectMessageRange SelectNumStar SelectNumStar) =
-		"*:*"
-
-	showList ms t = intercalate "," (map show ms) ++ t
-
-instance Read MessageSelector where
-	-- Parse 1,5:12,6 into [1, 5-12, 6]
-	-- Currently pancakes errors, this may not be the desired behaviour
-	readsPrec _ sel
-		| ':' `elem` this =
-			case (start,end) of
-				(Just s, Just e) ->
-					[(SelectMessageRange s e, rest)]
-				_ -> []
-		| otherwise =
-			case thisAsN of
-				Just x -> [(SelectMessage x, rest)]
-				Nothing -> []
-		where
-		start = fmap fst $ safeHead $ reads start'
-		end = fmap fst $ safeHead $ reads $ tail end'
-		(start',end') = span (/=':') this
-		thisAsN = fmap fst $ safeHead $ reads this
-		rest = safeTail rest'
-		(this,rest') = span (/=',') sel
-
-	readList "" = [([],"")]
-	readList sel = case safeHead $ reads sel of
-		Just (s,rest) -> [(s : fst (head $ readList rest), "")]
-		Nothing -> [([],"")]
 
 -- Convert selectors over UIDs to a selector over SeqNums
 selectUIDs :: Chan PthMsg -> FilePath -> [MessageSelector] -> IO [MessageSelector]
@@ -494,27 +503,6 @@ squishBody = squishBody' [] Nothing
 		| otherwise = squishBody' (w:acc) Nothing ws
 	squishBody' acc _ [] = reverse acc
 	squishBody' _ _ _ = error "programmer error"
-
-safeTail :: [a] -> [a]
-safeTail [] = []
-safeTail (_:tl) = tl
-
-safeHead :: [a] -> Maybe a
-safeHead [] = Nothing
-safeHead (x:_) = Just x
-
-maybeErr :: (Monad m) => String -> Maybe a -> m a
-maybeErr msg Nothing = fail msg
-maybeErr _ (Just x) = return x
-
-stp :: Char -> Char -> String -> String
-stp _ _ [] = []
-stp lead trail (l:str) | l == lead = stpTrail str
-                       | otherwise = stpTrail (l:str)
-	where
-	stpTrail [] = []
-	stpTrail s | last s == trail = init s
-	stpTrail s = s
 
 astring :: (MonadIO m) => (String -> IO ()) -> [String] -> m (Either String (BS.ByteString, [String]))
 astring _ [] = runErrorT $ fail "Empty argument?"
@@ -696,3 +684,29 @@ stdinServer out getpth maildir selected = do
 	stripPeek str = str
 	putS = put . fromString
 	put x = writeChan out $! x
+
+-- stdoutServer synchronises output
+
+stdoutServer :: Chan BS.ByteString -> IO ()
+stdoutServer chan = forever $ do
+	bytes <- readChan chan
+	BS.putStr bytes
+
+-- It all starts here
+
+capabilities :: String
+capabilities = "IMAP4rev1"
+
+main :: IO ()
+main = do
+	maildir <- (fromMaybe (error "No Maildir specified") . safeHead)
+		`fmap` getArgs
+	_ <- txtHandle stdin -- stdin is text for commands, may switch
+	_ <- binHandle stdout
+	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
+	stdoutChan <- newChan
+	pthChan <- newChan
+	forkIO_ $ pthServer maildir pthChan stdoutChan
+	forkIO_ $ stdoutServer stdoutChan
+	stdinServer stdoutChan pthChan maildir Nothing
+		`finally` syncCall pthChan MsgFinish -- Ensure pthServer is done
