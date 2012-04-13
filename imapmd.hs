@@ -671,9 +671,9 @@ stdinServer out getpth maildir selected = do
 			[] -> BS.concat (
 				map fromString ["{",show (BS.length raw),"}\r\n"] ++ [raw])
 			_ | "HEADER.FIELDS" `isPrefixOf` section ->
-				let headers = words $ init $ drop 15 section in
-					let
-						str = (intercalate "\r\n" (
+				let
+					headers = words $ init $ drop 15 section
+					str = (intercalate "\r\n" (
 							foldr (\header acc ->
 								let hn = map toLower header ++ ":" in
 									case find (\hdata -> MIME.h_name hdata == hn)
@@ -681,10 +681,10 @@ stdinServer out getpth maildir selected = do
 										Just hd -> MIME.h_raw_header hd ++ acc
 										Nothing -> acc
 							) [] headers) ++ "\r\n")
-						bstr = fromString str
-						l = fromString ("{" ++ show (BS.length bstr) ++ "}\r\n")
-					in
-						BS.append l bstr
+					bstr = fromString str
+					l = fromString ("{" ++ show (BS.length bstr) ++ "}\r\n")
+				in
+					BS.append l bstr
 			_ -> BS.empty -- TODO
 	body _ _ _= BS.empty -- TODO
 	handleErr tag _ (Left err) =
