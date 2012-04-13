@@ -1,3 +1,7 @@
 STATUS command
-SEARCH command (start with just ALL, for Modest)
-BUG: notify client of deletions and flag changes and new messages, right now all the client's sequence numbers during the session may be off
+CLOSE command
+More complex queries to FETCH
+commands that actually make changes
+
+Do we want SUBSCRIBE and working LSUB? What are they for?
+Do we want proper SEARCH?  Would take more indexing to be performant.
