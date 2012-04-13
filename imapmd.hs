@@ -48,12 +48,9 @@ instance Enum MIME.Month where
 	fromEnum MIME.Dec = 12
 	toEnum x = months !! (x - 1)
 
--- Handy run-concurrently operator
-(<|*|>) :: IO a -> IO b -> IO ()
-a <|*|> b = do
-	_ <- forkIO (a >> return ())
-	_ <- b
-	return ()
+-- Run in background
+forkIO_ :: IO a -> IO ()
+forkIO_ x = forkIO (x >> return ()) >> return ()
 
 strftime :: (FormatTime t) => String -> t -> String
 strftime = formatTime defaultTimeLocale
@@ -83,9 +80,10 @@ main = do
 	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
 	stdoutChan <- newChan
 	pthChan <- newChan
-	pthServer maildir pthChan <|*|> stdoutServer stdoutChan <|*|>
-		stdinServer stdoutChan pthChan maildir Nothing
-			`finally` syncCall pthChan MsgFlush
+	forkIO_ $ pthServer maildir pthChan
+	forkIO_ $ stdoutServer stdoutChan
+	stdinServer stdoutChan pthChan maildir Nothing
+		`finally` syncCall pthChan MsgFlush
 
 binHandle :: Handle -> IO Handle
 binHandle handle = do
@@ -167,7 +165,7 @@ pthServer root chan = withINotify (\inotify -> do
 			else
 				-- Flush uidlists on background thread
 				-- XXX: Should we keep track of which are dirty?
-				(rewriteUidlists maps <|*|> return ()) >> return 0
+				forkIO_ (rewriteUidlists maps) >> return 0
 		msg <- readChan chan
 		case msg of
 			(MsgAll mbox r) -> writeChan r (trd3 $ getMbox mbox maps)
