@@ -385,13 +385,11 @@ selectUIDs getpth mbox mselectors =
 			(fmap sq2sl $
 				syncCall getpth (MsgSeq mbox (UID e) True))
 		(SelectMessageRange (SelectNum s) SelectNumStar) ->
-			fmap (`SelectMessageRange` SelectNumStar)
-			(fmap sq2sl $
-				syncCall getpth (MsgSeq mbox (UID s) True))
+			fmap ((`SelectMessageRange` SelectNumStar) . sq2sl)
+			(syncCall getpth (MsgSeq mbox (UID s) True))
 		(SelectMessageRange SelectNumStar (SelectNum e)) ->
-			fmap (SelectMessageRange SelectNumStar)
-			(fmap sq2sl $
-				syncCall getpth (MsgSeq mbox (UID e) True))
+			fmap (SelectMessageRange SelectNumStar . sq2sl)
+			(syncCall getpth (MsgSeq mbox (UID e) True))
 		_ -> return x
 	) mselectors
 	where
@@ -412,14 +410,14 @@ selectMsgs xs (SelectMessage x : rest) =
 
 imapSearch :: Chan PthMsg -> FilePath -> Vector (UID, FilePath) -> [String] -> IO [(UID,SeqNum)]
 imapSearch _ _ _ [] = return []
-imapSearch getpth mbox xs (q:a:_) | map toUpper q == "UID" = do
+imapSearch getpth mbox xs (q:a:_) | map toUpper q == "UID" =
 	-- a is a message selector, but with UIDs
 	-- TODO: we are ignoring the rest of the query here
-	fmap (map ((\(s,(u,_)) -> (u,s))) . selectMsgs xs)
+	fmap (map (\(s,(u,_)) -> (u,s)) . selectMsgs xs)
 		(selectUIDs getpth mbox (read a))
-imapSearch _ _ xs (q:_) = do
+imapSearch _ _ xs (q:_) =
 	-- try SeqNum message set as last resort?
-	return $ (map ((\(s,(u,_)) -> (u,s))) . selectMsgs xs) (read q)
+	return $ (map (\(s,(u,_)) -> (u,s)) . selectMsgs xs) (read q)
 --imapSearch _ _ _ _ = error "Unsupported IMAP search query"
 
 maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
