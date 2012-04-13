@@ -524,7 +524,6 @@ astring _ (hd:rest) = runErrorT $ return (fromString hd, rest)
 stdinServer :: Chan BS.ByteString -> Chan PthMsg -> FilePath -> Maybe FilePath -> IO ()
 stdinServer out getpth maildir selected = do
 	line <- fmap words getLine
-	hPutStrLn stderr (show (selected,line))
 	case line of
 		(tag:cmd:rest) -> do
 			let cmd' = map toUpper cmd
