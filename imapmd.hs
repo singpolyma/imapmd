@@ -16,6 +16,7 @@ import System.IO.Unsafe (unsafeInterleaveIO)
 import System.INotify
 import System.Locale (defaultTimeLocale)
 import System.Directory
+import System.Console.GetOpt
 import Data.ByteString.UTF8 (fromString, toString)
 import Numeric.Search.Range (searchFromTo)
 import Data.Vector (Vector)
@@ -693,19 +694,45 @@ stdoutServer chan = forever $ do
 
 -- It all starts here
 
+data Flag = AuthForce | Help deriving (Show, Read, Eq)
+
+flags :: [OptDescr Flag]
+flags = [
+		Option ['A'] ["auth-force"] (NoArg AuthForce)
+			"Force client to authenticate. Some clients need this.",
+		Option ['h'] ["help"] (NoArg Help)
+			"Show this help text."
+	]
+
+usage :: [String] -> IO ()
+usage errors = do
+	mapM_ putStrLn errors
+	putStrLn $ usageInfo "imapmd [-A] MAILDIR" flags
+
 capabilities :: String
 capabilities = "IMAP4rev1"
 
 main :: IO ()
 main = do
-	maildir <- (fromMaybe (error "No Maildir specified") . safeHead)
-		`fmap` getArgs
-	_ <- txtHandle stdin -- stdin is text for commands, may switch
-	_ <- binHandle stdout
-	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
-	stdoutChan <- newChan
-	pthChan <- newChan
-	forkIO_ $ pthServer maildir pthChan stdoutChan
-	forkIO_ $ stdoutServer stdoutChan
-	stdinServer stdoutChan pthChan maildir Nothing
-		`finally` syncCall pthChan MsgFinish -- Ensure pthServer is done
+	(flags, args, errors) <- liftM (getOpt RequireOrder [
+			Option ['A'] ["auth-force"] (NoArg AuthForce)
+				"Force client to authenticate. Some clients need this.",
+			Option ['h'] ["help"] (NoArg Help)
+				"Show this help text."
+		]) getArgs
+
+	if length args /= 1 || Help `elem` flags || (not . null) errors
+		then usage errors else do
+			let maildir = head args
+			_ <- txtHandle stdin -- stdin is text for commands, may switch
+			_ <- binHandle stdout
+			if AuthForce `elem` flags then putStr "* OK " else
+				putStr "* PREAUTH "
+			putStr $ capabilities ++ " ready\r\n"
+			stdoutChan <- newChan
+			pthChan <- newChan
+			forkIO_ $ pthServer maildir pthChan stdoutChan
+			forkIO_ $ stdoutServer stdoutChan
+			stdinServer stdoutChan pthChan maildir Nothing
+				-- Ensure pthServer is done
+				`finally` syncCall pthChan MsgFinish
