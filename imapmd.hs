@@ -29,6 +29,7 @@ import qualified System.FilePath.FilePather.FilterPredicate as FP
 import qualified System.FilePath.FilePather.FileType as FP
 import qualified System.FilePath.FilePather.RecursePredicate as FP
 import qualified Codec.MIME.String as MIME
+import qualified System.Posix.FileLock as FL
 
 months :: [MIME.Month]
 months = [MIME.Jan, MIME.Feb, MIME.Mar, MIME.Apr, MIME.May, MIME.Jun, MIME.Jul, MIME.Aug, MIME.Sep, MIME.Oct, MIME.Nov, MIME.Dec]
@@ -83,7 +84,7 @@ main = do
 	forkIO_ $ pthServer maildir pthChan
 	forkIO_ $ stdoutServer stdoutChan
 	stdinServer stdoutChan pthChan maildir Nothing
-		`finally` syncCall pthChan MsgFlush
+		`finally` syncCall pthChan MsgFinish -- Ensure pthServer is done
 
 binHandle :: Handle -> IO Handle
 binHandle handle = do
@@ -132,26 +133,30 @@ data PthMsg =
 	UIDNext FilePath (Chan UID) |
 	MsgNew FilePath FilePath |
 	MsgDel FilePath FilePath |
-	MsgFlush (Chan ())
+	MsgFinish (Chan ())
 
 pthServer :: FilePath -> Chan PthMsg -> IO ()
 pthServer root chan = withINotify (\inotify -> do
 		mboxes <- maildirFind (const True) (const True) root >>=
 			filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
-		maps <- mapM (\mbox -> do
-				exist <- doesFileExist (FP.joinPath [mbox,"uidlist"])
-				time <- fmap (strftime "%s") getCurrentTime
-				ms <- if exist then parseUidlist mbox else
-					return (read time, UID 1, Map.empty)
-				(valid,nuid,sorted) <- updateUidlist ms mbox
-				let cur = FP.joinPath [mbox, "cur"]
-				_ <- addWatch inotify
-					[Create,MoveIn,Delete] cur (handleINotify mbox)
-				return (mbox, (valid,nuid,Vector.fromList sorted))
+		maps <- mapM (\mbox ->
+				uidlistFromFile mbox >>= updateUidlistAndWatch inotify mbox
 			) mboxes
-		pthServer' (0::Int) (Map.fromList maps)
+		pthServer' (Map.fromList maps)
 	)
 	where
+	uidlistFromFile mbox =
+		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.ReadLock $ do
+			exist <- doesFileExist (FP.joinPath [mbox,"uidlist"])
+			time <- fmap (strftime "%s") getCurrentTime
+			if exist then parseUidlist mbox else
+				return (read time, UID 1, Map.empty)
+	updateUidlistAndWatch i mbox ms =
+		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $ do
+			(valid,nuid,sorted) <- updateUidlist ms mbox
+			let cur = FP.joinPath [mbox, "cur"]
+			_ <- addWatch i [Create,MoveIn,Delete] cur (handleINotify mbox)
+			return (mbox, (valid,nuid,Vector.fromList sorted))
 	handleINotify mbox (Created { isDirectory = False, filePath = pth }) =
 		writeChan chan (MsgNew mbox pth)
 	handleINotify mbox (MovedIn { isDirectory = False, filePath = pth }) =
@@ -159,13 +164,7 @@ pthServer root chan = withINotify (\inotify -> do
 	handleINotify mbox (Deleted { filePath = pth }) =
 		writeChan chan (MsgDel mbox pth)
 	handleINotify _ _ = return () -- Ignore other events
-	pthServer' updateCounterIn maps = do
-		updateCounter <- if updateCounterIn < 10 then
-				return updateCounterIn
-			else
-				-- Flush uidlists on background thread
-				-- XXX: Should we keep track of which are dirty?
-				forkIO_ (rewriteUidlists maps) >> return 0
+	pthServer' maps = do
 		msg <- readChan chan
 		case msg of
 			(MsgAll mbox r) -> writeChan r (trd3 $ getMbox mbox maps)
@@ -187,19 +186,21 @@ pthServer root chan = withINotify (\inotify -> do
 				-- If we already know about the unique part of this path,
 				-- it is a rename. Else it is a new message
 				let u = stripFlags pth in
-				pthServer' (succ updateCounter) $ Map.adjust (\(v,n,m) ->
+				rewriteUidlistAndNext mbox $ Map.adjust (\(v,n,m) ->
 					case Vector.findIndex (\(_,mp) -> u == stripFlags mp) m of
 						Just i ->
 							(v,n,(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
 						Nothing -> (v, succ n, Vector.snoc m (n,pth))
 				) mbox maps
 			(MsgDel mbox pth) ->
-				pthServer' (succ updateCounter) $ Map.adjust (\(v,n,m) ->
+				rewriteUidlistAndNext mbox $ Map.adjust (\(v,n,m) ->
 					let (l,a) = Vector.break (\(_,fp) -> fp == pth) m in
 					(v, n, (Vector.++) l (Vector.tail a))
 				) mbox maps
-			MsgFlush r -> rewriteUidlists maps >> writeChan r ()
-		pthServer' updateCounter maps
+			(MsgFinish r) ->
+				-- If we got this message, then we have processed the whole Q
+				writeChan r ()
+		pthServer' maps
 	fst3 (v,_,_) = v
 	snd3 (_,n,_) = n
 	trd3 (_,_,m) = m
@@ -210,9 +211,12 @@ pthServer root chan = withINotify (\inotify -> do
 		k <- searchFromTo (\i -> fst ((Vector.!) sequence i) >= uid) l h
 		guard (fuzzy || fst ((Vector.!) sequence k) == uid)
 		return k
-	rewriteUidlists maps = mapM_ (\(mbox,(v,n,m)) ->
+	rewriteUidlistAndNext mbox maps = do
+		forkIO_ (writeUidlistWithLock mbox ((Map.!) maps mbox))
+		pthServer' maps
+	writeUidlistWithLock mbox (v,n,m) =
+		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $
 			writeUidlist (v,n,Vector.toList m) mbox
-		) (Map.toList maps)
 
 taggedItem :: Char -> [String] -> String
 taggedItem _ [] = error "No such item"
