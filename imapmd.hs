@@ -69,6 +69,15 @@ realDirectoryContents :: FilePath -> IO [FilePath]
 realDirectoryContents path = (map (\p -> FP.joinPath [path,p]) .
 	filter (`notElem` [".",".."])) `fmap` getDirectoryContents path
 
+-- WARNING: only use this if you *know* no one else is reading the Chan
+drainChan :: Chan a -> IO [a]
+drainChan chan = do
+	empty <- isEmptyChan chan
+	if empty then return [] else do
+		v <- readChan chan
+		rest <- drainChan chan
+		return (v : rest)
+
 capabilities :: String
 capabilities = "IMAP4rev1"
 
@@ -81,7 +90,7 @@ main = do
 	putStr $ "* PREAUTH " ++ capabilities ++ " ready\r\n"
 	stdoutChan <- newChan
 	pthChan <- newChan
-	forkIO_ $ pthServer maildir pthChan
+	forkIO_ $ pthServer maildir pthChan stdoutChan
 	forkIO_ $ stdoutServer stdoutChan
 	stdinServer stdoutChan pthChan maildir Nothing
 		`finally` syncCall pthChan MsgFinish -- Ensure pthServer is done
@@ -131,18 +140,20 @@ data PthMsg =
 	MsgSeq FilePath UID Bool (Chan SeqNum) |
 	UIDValidity FilePath (Chan Int) |
 	UIDNext FilePath (Chan UID) |
+	MsgMbox (Maybe FilePath) | -- For which async notifications to generate
 	MsgNew FilePath FilePath |
-	MsgDel FilePath FilePath |
+	MsgDelFlush (Chan ()) |
 	MsgFinish (Chan ())
 
-pthServer :: FilePath -> Chan PthMsg -> IO ()
-pthServer root chan = withINotify (\inotify -> do
+pthServer :: FilePath -> Chan PthMsg -> Chan BS.ByteString -> IO ()
+pthServer root chan stdoutChan = withINotify (\inotify -> do
 		mboxes <- maildirFind (const True) (const True) root >>=
 			filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
+		dC <- newChan -- Channel to store pending deletes
 		maps <- mapM (\mbox ->
-				uidlistFromFile mbox >>= updateUidlistAndWatch inotify mbox
+				uidlistFromFile mbox >>= updateUidlistAndWatch inotify dC mbox
 			) mboxes
-		pthServer' (Map.fromList maps)
+		pthServer' (Map.fromList maps) Nothing dC
 	)
 	where
 	uidlistFromFile mbox =
@@ -151,20 +162,20 @@ pthServer root chan = withINotify (\inotify -> do
 			time <- fmap (strftime "%s") getCurrentTime
 			if exist then parseUidlist mbox else
 				return (read time, UID 1, Map.empty)
-	updateUidlistAndWatch i mbox ms =
+	updateUidlistAndWatch i dC mbox ms =
 		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $ do
 			(valid,nuid,sorted) <- updateUidlist ms mbox
-			let cur = FP.joinPath [mbox, "cur"]
-			_ <- addWatch i [Create,MoveIn,Delete] cur (handleINotify mbox)
+			_ <- addWatch i [Create,MoveIn,Delete] (FP.joinPath [mbox,"cur"])
+				(handleINotify mbox dC)
 			return (mbox, (valid,nuid,Vector.fromList sorted))
-	handleINotify mbox (Created { isDirectory = False, filePath = pth }) =
+	handleINotify mbox _ (Created { isDirectory = False,filePath = pth }) =
 		writeChan chan (MsgNew mbox pth)
-	handleINotify mbox (MovedIn { isDirectory = False, filePath = pth }) =
+	handleINotify mbox _ (MovedIn { isDirectory = False,filePath = pth }) =
 		writeChan chan (MsgNew mbox pth)
-	handleINotify mbox (Deleted { filePath = pth }) =
-		writeChan chan (MsgDel mbox pth)
-	handleINotify _ _ = return () -- Ignore other events
-	pthServer' maps = do
+	handleINotify mbox dC (Deleted { filePath = pth }) =
+		writeChan dC (mbox, pth)
+	handleINotify _ _ _ = return () -- Ignore other events
+	pthServer' maps selec dC = do
 		msg <- readChan chan
 		case msg of
 			(MsgAll mbox r) -> writeChan r (trd3 $ getMbox mbox maps)
@@ -182,41 +193,63 @@ pthServer root chan = withINotify (\inotify -> do
 				writeChan r (fst3 $ getMbox mbox maps)
 			(UIDNext mbox r) ->
 				writeChan r (snd3 $ getMbox mbox maps)
+			(MsgMbox sel) ->
+				pthServer' maps sel dC
 			(MsgNew mbox pth) ->
 				-- If we already know about the unique part of this path,
 				-- it is a rename. Else it is a new message
-				let u = stripFlags pth in
-				rewriteUidlistAndNext mbox $ Map.adjust (\(v,n,m) ->
-					case Vector.findIndex (\(_,mp) -> u == stripFlags mp) m of
-						Just i ->
-							(v,n,(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
-						Nothing -> (v, succ n, Vector.snoc m (n,pth))
-				) mbox maps
-			(MsgDel mbox pth) ->
-				rewriteUidlistAndNext mbox $ Map.adjust (\(v,n,m) ->
-					let (l,a) = Vector.break (\(_,fp) -> fp == pth) m in
-					(v, n, (Vector.++) l (Vector.tail a))
-				) mbox maps
+				let u = stripFlags pth
+				    (v,n,m) = getMbox mbox maps in
+				case Vector.findIndex (\(_,mp) -> u == stripFlags mp) m of
+					Just i -> do -- rename, flags changed
+						let x = (v, n,
+							(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
+						when (isSelected mbox selec) (printFlags i pth)
+						forkIO_ (writeUidlistWithLock mbox x)
+						pthServer' (Map.adjust (const x) mbox maps) selec dC
+					Nothing -> do
+						let x = (v, succ n, Vector.snoc m (n,pth))
+						when (isSelected mbox selec) (writeChan stdoutChan $
+							fromString $ "* EXISTS " ++
+								show (Vector.length m) ++ "\r\n")
+						forkIO_ (writeUidlistWithLock mbox x)
+						pthServer' (Map.adjust (const x) mbox maps) selec dC
+			(MsgDelFlush r) -> do
+				dels <- drainChan dC
+				maps' <- foldM (\maps' (mbox,pth) -> do
+						let (v,n,m) = getMbox mbox maps
+						let (l,a) = Vector.break (\(_,fp) -> fp == pth) m
+						when (isSelected mbox selec) (writeChan stdoutChan $
+							fromString $ "* " ++
+								show ((Vector.length l)+1) ++ " EXPUNGE\r\n")
+						return $ Map.adjust (const
+							(v, n, (Vector.++) l (Vector.tail a))) mbox maps'
+					) maps dels
+				forkIO_ $ rewriteUidlists maps'
+				writeChan r ()
+				pthServer' maps' selec dC
 			(MsgFinish r) ->
 				-- If we got this message, then we have processed the whole Q
 				writeChan r ()
-		pthServer' maps
+		pthServer' maps selec dC
 	fst3 (v,_,_) = v
 	snd3 (_,n,_) = n
 	trd3 (_,_,m) = m
 	getMbox mbox maps = fromMaybe (error ("No mailbox " ++ mbox)) $
 		Map.lookup mbox maps
+	isSelected mbox selected = fromMaybe False (fmap (==mbox) selected)
 	findUID fuzzy sequence uid = do
 		let (l,h) = (0, Vector.length sequence - 1)
 		k <- searchFromTo (\i -> fst ((Vector.!) sequence i) >= uid) l h
 		guard (fuzzy || fst ((Vector.!) sequence k) == uid)
 		return k
-	rewriteUidlistAndNext mbox maps = do
-		forkIO_ (writeUidlistWithLock mbox ((Map.!) maps mbox))
-		pthServer' maps
+	printFlags i pth = writeChan stdoutChan $ fromString $ "* " ++
+		show i ++ " FETCH (FLAGS (" ++ unwords (getFlags pth) ++ "))\r\n"
 	writeUidlistWithLock mbox (v,n,m) =
 		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $
 			writeUidlist (v,n,Vector.toList m) mbox
+	rewriteUidlists maps =
+		mapM_ (uncurry writeUidlistWithLock) (Map.toList maps)
 
 taggedItem :: Char -> [String] -> String
 taggedItem _ [] = error "No such item"
@@ -231,6 +264,17 @@ stripFlags pth
 	-- From newer base Data.List
 	dropWhileEnd p =
 		foldr (\x xs -> if p x && null xs then [] else x : xs) []
+
+getFlags :: String -> [String]
+getFlags pth =
+	foldr (\f acc -> case f of
+		'R' -> "\\Answered" : acc
+		'S' -> "\\Seen" : acc
+		'T' -> "\\Deleted" : acc
+		'D' -> "\\Draft" : acc
+		'F' -> "\\Flagged" : acc
+		_ -> acc
+	) [] (takeWhile (/=':') $ reverse pth)
 
 parseUidlist :: FilePath -> IO (Int, UID, Map FilePath UID)
 parseUidlist mbox = do
@@ -494,8 +538,12 @@ stdinServer out getpth maildir selected = do
 	line <- fmap words getLine
 	hPutStrLn stderr (show (selected,line))
 	case line of
-		(tag:cmd:rest) ->
-			command tag (map toUpper cmd) rest
+		(tag:cmd:rest) -> do
+			let cmd' = map toUpper cmd
+			when (cmd' `notElem` ["FETCH","STORE","SEARCH","UID"]) (
+					syncCall getpth MsgDelFlush
+				)
+			command tag (map toUpper cmd') rest
 				`catch` (\(SomeException ex) ->
 					putS (tag ++ " BAD " ++ show ex ++ "\r\n")
 				)
@@ -538,6 +586,7 @@ stdinServer out getpth maildir selected = do
 			putS $ "* OK [UIDNEXT " ++ show uidnext ++ "]\r\n"
 			-- XXX: Read only because we have no writing commands yet
 			putS $ tag ++ " OK [READ-ONLY] SELECT completed\r\n"
+			writeChan getpth (MsgMbox (Just mbox'))
 			next (Just mbox')
 		)
 	command tag "FETCH" args = fetch_cmd False tag args
@@ -610,14 +659,7 @@ stdinServer out getpth maildir selected = do
 				MIME.mi_date $ MIME.m_message_info m
 	fetch "RFC822.SIZE" _ _ raw _ = fromString $ show $ BS.length raw
 	fetch "FLAGS" _ pth _ _ = fromString $
-		'(' : unwords (foldr (\f acc -> case f of
-			'R' -> "\\Answered" : acc
-			'S' -> "\\Seen" : acc
-			'T' -> "\\Deleted" : acc
-			'D' -> "\\Draft" : acc
-			'F' -> "\\Flagged" : acc
-			_ -> acc
-		) [] (takeWhile (/=',') $ reverse pth)) ++ ")"
+		'(' : unwords (getFlags pth) ++ ")"
 	fetch sel _ _ raw m | "BODY.PEEK" `isPrefixOf` sel =
 		body (drop 9 sel) raw m
 	fetch sel _ _ raw m | "BODY" `isPrefixOf` sel =
