@@ -338,6 +338,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 	updateUidlistAndWatch i dC mbox ms =
 		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $ do
 			(valid,nuid,sorted) <- updateUidlist ms mbox
+			-- TODO: Should MoveOut not followed by MoveIn be Delete?
 			_ <- addWatch i [Create,MoveIn,Delete] (FP.joinPath [mbox,"cur"])
 				(handleINotify mbox dC)
 			return (mbox, (valid,nuid,Vector.fromList sorted))
