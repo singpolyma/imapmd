@@ -24,6 +24,10 @@ import qualified Data.Vector as Vector
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString as BS
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as T
+import qualified Data.Text.Read as T
 import qualified System.FilePath as FP
 import qualified System.FilePath.FilePather.Find as FP
 import qualified System.FilePath.FilePather.FilterPredicate as FP
@@ -70,10 +74,17 @@ forkIO_ x = forkIO (x >> return ()) >> return ()
 strftime :: (FormatTime t) => String -> t -> String
 strftime = formatTime defaultTimeLocale
 
-realDirectoryContents :: FilePath -> IO [FilePath]
-realDirectoryContents path = (map (\p -> FP.joinPath [path,p]) .
+textToInt :: Text -> Int
+textToInt t = let (Right (x,_)) = T.decimal t in x
+
+realDirectoryContents :: Bool -> FilePath -> IO [FilePath]
+realDirectoryContents fullPath path = (maybeFullPath .
 	filter (\p -> p `notElem` [".",".."] && not ("." `isPrefixOf` p)))
 		`fmap` getDirectoryContents path
+	where
+	maybeFullPath
+		| fullPath = map (\p -> FP.joinPath [path,p])
+		| otherwise = id
 
 -- WARNING: only use this if you *know* no one else is reading the Chan
 drainChan :: Chan a -> IO [a]
@@ -97,10 +108,12 @@ txtHandle handle = do
 	hSetBuffering handle LineBuffering
 	return handle
 
-taggedItem :: Char -> [String] -> String
-taggedItem _ [] = error "No such item"
-taggedItem c ((t:r):_) | t == c = r
-taggedItem c (_:ws) = taggedItem c ws
+taggedItemT :: Char -> [Text] -> Text
+taggedItemT _ [] = error "No such item"
+taggedItemT c (w:ws)
+	| T.null w = taggedItemT c ws
+	| T.head w == c = T.tail w
+	| otherwise = taggedItemT c ws
 
 stripFlags :: String -> String
 stripFlags pth
@@ -110,6 +123,11 @@ stripFlags pth
 	-- From newer base Data.List
 	dropWhileEnd p =
 		foldr (\x xs -> if p x && null xs then [] else x : xs) []
+
+stripFlagsT :: Text -> Text
+stripFlagsT pth
+	| isJust $ T.find (==':') pth = T.init $ T.dropWhileEnd (/=':') pth
+	| otherwise = pth
 
 getFlags :: String -> [String]
 getFlags pth =
@@ -252,35 +270,34 @@ data PthMsg =
 	MsgDelFlush (Chan ()) |
 	MsgFinish (Chan ())
 
-parseUidlist :: FilePath -> IO (Int, UID, Map FilePath UID)
+parseUidlist :: FilePath -> IO (Int, UID, Map Text UID)
 parseUidlist mbox = do
-	uidlist <- fmap lines $ readFile (FP.joinPath [mbox,"uidlist"])
-	let header = words $ drop 2 (head uidlist)
+	uidlist <- fmap T.lines $ T.readFile (FP.joinPath [mbox,"uidlist"])
+	let header = T.words $ T.drop 2 (head uidlist)
 	let uids = map ((\(uid:meta) ->
-			(stripFlags $ taggedItem ':' meta, read uid)
-		) . words) (tail uidlist)
+			(stripFlagsT $ taggedItemT ':' meta, UID $ textToInt uid)
+		) . T.words) (tail uidlist)
 	return (
-			read $ taggedItem 'V' header,
-			read $ taggedItem 'N' header,
+			textToInt $ taggedItemT 'V' header,
+			UID $ textToInt $ taggedItemT 'N' header,
 			Map.fromList uids
 		)
 
-updateUidlist :: (Int, UID, Map FilePath UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
+updateUidlist :: (Int, UID, Map Text UID) -> FilePath -> IO (Int, UID, [(UID,FilePath)])
 updateUidlist (valid, nuid, uids) mbox = do
 	-- Just move all new mail to cur with no flags
-	new <- realDirectoryContents $ FP.joinPath [mbox, "new"]
+	new <- realDirectoryContents True $ FP.joinPath [mbox, "new"]
 	mapM_ (\pth ->
 			let basename = FP.takeFileName pth
 			    flagname = stripFlags basename ++ ":2," in
 			renameFile pth (FP.joinPath [mbox, "cur", flagname])
 		) new
 
-	cur <- realDirectoryContents $ FP.joinPath [mbox, "cur"]
+	cur <- realDirectoryContents False $ FP.joinPath [mbox, "cur"]
 	let (nuid',unsorted) = foldl' (\(nuid,acc) m ->
-			let basename = FP.takeFileName m in
-			case Map.lookup (stripFlags basename) uids of
-				Just uid -> (nuid,(uid,basename):acc)
-				Nothing -> (succ nuid,(nuid,basename):acc)
+			case Map.lookup (stripFlagsT $ T.pack m) uids of
+				Just uid -> (nuid,(uid,m):acc)
+				Nothing -> (succ nuid,(nuid,m):acc)
 		) (nuid,[]) cur
 	let sorted = sortBy (comparing fst) unsorted
 
