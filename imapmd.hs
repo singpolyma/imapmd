@@ -356,7 +356,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 			(MsgAll mbox r) -> writeChan r $ maybeTail lOff $
 				trd3 $ getMbox mbox maps
 			(MsgCount mbox r) -> writeChan r $
-				maybeLimit $ Vector.length $ trd3 $ getMbox mbox maps
+				maybeLimit lOff $ Vector.length $ trd3 $ getMbox mbox maps
 			(MsgUID mbox s r) -> let m = trd3 $ getMbox mbox maps in
 				writeChan r $ fst $ (Vector.!) m (s `maybeIndexIn'` m)
 			(MsgSeq mbox uid fuzzy r) -> let m = trd3 $ getMbox mbox maps in
@@ -389,8 +389,8 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 					Nothing -> do
 						let x = (v, succ n, Vector.snoc m (n,pth))
 						when (isSelected mbox selec) (writeChan stdoutChan $
-							fromString $ "* EXISTS " ++
-								show (maybeLimit $ Vector.length m) ++ "\r\n")
+							fromString $ "* " ++ show (maybeLimit (succ lOff) $
+								Vector.length m) ++ " EXISTS\r\n")
 						forkIO_ (writeUidlistWithLock mbox x)
 						-- Message added, increase soft cap
 						pthServer' (Map.adjust (const x) mbox maps)
@@ -424,14 +424,21 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 	maybeTail lOff x = case limit of
 		(Just l) -> Vector.drop (Vector.length x - (l+lOff)) x
 		Nothing -> x
-	maybeLimit x = min x (fromMaybe x limit)
+	maybeLimit lOff x = case limit of
+		(Just l) -> min x (l+lOff)
+		Nothing -> x
 	fst3 (v,_,_) = v
 	snd3 (_,n,_) = n
 	trd3 (_,_,m) = m
 	getMbox mbox maps = fromMaybe (error ("No mailbox " ++ mbox)) $
 		Map.lookup mbox maps
 	isSelected mbox selected = fromMaybe False (fmap (==mbox) selected)
-	findUID fuzzy sequence uid = do
+	findUID False sequence uid = findUID' False sequence uid
+	findUID True sequence uid =
+		case findUID' True sequence uid of
+			(Just i) -> Just i
+			Nothing -> Just (Vector.length sequence - 1)
+	findUID' fuzzy sequence uid = do
 		let (l,h) = (0, Vector.length sequence - 1)
 		k <- searchFromTo (\i -> fst ((Vector.!) sequence i) >= uid) l h
 		guard (fuzzy || fst ((Vector.!) sequence k) == uid)
