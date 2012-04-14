@@ -72,7 +72,8 @@ strftime = formatTime defaultTimeLocale
 
 realDirectoryContents :: FilePath -> IO [FilePath]
 realDirectoryContents path = (map (\p -> FP.joinPath [path,p]) .
-	filter (`notElem` [".",".."])) `fmap` getDirectoryContents path
+	filter (\p -> p `notElem` [".",".."] && not ("." `isPrefixOf` p)))
+		`fmap` getDirectoryContents path
 
 -- WARNING: only use this if you *know* no one else is reading the Chan
 drainChan :: Chan a -> IO [a]
@@ -484,7 +485,8 @@ maildirFind fpred rpred mbox = FP.find
 	where
 	normPred pred x =
 		let s = FP.splitDirectories $ FP.normalise x in
-			last s `notElem` ["new","cur","tmp"] && pred s
+			last s `notElem` ["new","cur","tmp"] &&
+				not ("." `isPrefixOf` last s) && pred s
 
 squishBody :: [String] -> [String]
 squishBody = squishBody' [] Nothing
