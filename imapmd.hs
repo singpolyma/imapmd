@@ -170,11 +170,17 @@ instance Show UID where
 instance Read UID where
 	readsPrec p s = map (first UID) $ readsPrec p s
 
-newtype SeqNum = SeqNum Int deriving (Show, Read, Eq, Ord)
+newtype SeqNum = SeqNum Int deriving (Eq, Ord)
 
 instance Enum SeqNum where
 	fromEnum (SeqNum i) = i-1
 	toEnum i = SeqNum (i+1)
+
+instance Show SeqNum where
+	show (SeqNum i) = show i
+
+instance Read SeqNum where
+	readsPrec p s = map (first SeqNum) $ readsPrec p s
 
 data SelectNum = SelectNum Int | SelectNumStar deriving (Eq)
 
@@ -295,8 +301,8 @@ writeUidlist (valid, nuid, sorted) mbox = do
 	hClose uidlst
 	renameFile tmpth (FP.joinPath [mbox,"uidlist"])
 
-pthServer :: FilePath -> Chan PthMsg -> Chan BS.ByteString -> IO ()
-pthServer root chan stdoutChan = withINotify (\inotify -> do
+pthServer :: FilePath -> Maybe Int -> Chan PthMsg -> Chan BS.ByteString -> IO ()
+pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 		mboxes <- maildirFind (const True) (const True) root >>=
 			filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
 		dC <- newChan -- Channel to store pending deletes
@@ -328,17 +334,19 @@ pthServer root chan stdoutChan = withINotify (\inotify -> do
 	pthServer' maps selec dC = do
 		msg <- readChan chan
 		case msg of
-			(MsgAll mbox r) -> writeChan r (trd3 $ getMbox mbox maps)
+			(MsgAll mbox r) -> writeChan r $ maybeTail $
+				trd3 $ getMbox mbox maps
 			(MsgCount mbox r) -> writeChan r $
-				Vector.length $ trd3 $ getMbox mbox maps
-			(MsgUID mbox s r) -> writeChan r $
-				fst $ (Vector.!) (trd3 $ getMbox mbox maps) (fromEnum s)
-			(MsgSeq mbox uid fuzzy r) -> writeChan r $
-				case findUID fuzzy (trd3 $ getMbox mbox maps) uid of
-					Just i -> toEnum i
+				maybeLimit $ Vector.length $ trd3 $ getMbox mbox maps
+			(MsgUID mbox s r) -> let m = trd3 $ getMbox mbox maps in
+				writeChan r $ fst $ (Vector.!) m (s `maybeIndexIn` m)
+			(MsgSeq mbox uid fuzzy r) -> let m = trd3 $ getMbox mbox maps in
+				writeChan r $
+				case findUID fuzzy m uid of
+					Just i -> i `maybeFromIndex` m
 					Nothing -> error ("UID " ++ show uid ++ "out of range")
-			(MsgPath mbox s r) -> writeChan r $
-				snd $ (Vector.!) (trd3 $ getMbox mbox maps) (fromEnum s)
+			(MsgPath mbox s r) -> let m = trd3 $ getMbox mbox maps in
+				writeChan r $ snd $ (Vector.!) m (s `maybeIndexIn` m)
 			(UIDValidity mbox r) ->
 				writeChan r (fst3 $ getMbox mbox maps)
 			(UIDNext mbox r) ->
@@ -354,14 +362,15 @@ pthServer root chan stdoutChan = withINotify (\inotify -> do
 					Just i -> do -- rename, flags changed
 						let x = (v, n,
 							(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
-						when (isSelected mbox selec) (printFlags i pth)
+						let s = i `maybeFromIndex` m
+						when (isSelected mbox selec) (printFlags s pth)
 						forkIO_ (writeUidlistWithLock mbox x)
 						pthServer' (Map.adjust (const x) mbox maps) selec dC
 					Nothing -> do
 						let x = (v, succ n, Vector.snoc m (n,pth))
 						when (isSelected mbox selec) (writeChan stdoutChan $
 							fromString $ "* EXISTS " ++
-								show (Vector.length m) ++ "\r\n")
+								show (maybeLimit $ Vector.length m) ++ "\r\n")
 						forkIO_ (writeUidlistWithLock mbox x)
 						pthServer' (Map.adjust (const x) mbox maps) selec dC
 			(MsgDelFlush r) -> do
@@ -370,8 +379,8 @@ pthServer root chan stdoutChan = withINotify (\inotify -> do
 						let (v,n,m) = getMbox mbox maps
 						let (l,a) = Vector.break (\(_,fp) -> fp == pth) m
 						when (isSelected mbox selec) (writeChan stdoutChan $
-							fromString $ "* " ++
-								show (1 + Vector.length l) ++ " EXPUNGE\r\n")
+							fromString $ "* " ++ show ((1 + Vector.length l)
+								`maybeFromIndex` m) ++ " EXPUNGE\r\n")
 						return $ Map.adjust (const
 							(v, n, (Vector.++) l (Vector.tail a))) mbox maps'
 					) maps dels
@@ -382,6 +391,18 @@ pthServer root chan stdoutChan = withINotify (\inotify -> do
 				-- If we got this message, then we have processed the whole Q
 				writeChan r ()
 		pthServer' maps selec dC
+	maybeFromIndex i x = case limit of
+		(Just l) -> let v = i - (Vector.length x - l) in
+			(toEnum $ max 0 v) :: SeqNum
+		Nothing -> (toEnum i) :: SeqNum
+	maybeIndexIn s x = let s' = (fromEnum (s :: SeqNum)) in
+		case limit of
+			(Just l) -> s' + (Vector.length x - l)
+			Nothing -> s'
+	maybeTail x = case limit of
+		(Just l) -> Vector.drop (Vector.length x - l) x
+		Nothing -> x
+	maybeLimit x = min x (fromMaybe x limit)
 	fst3 (v,_,_) = v
 	snd3 (_,n,_) = n
 	trd3 (_,_,m) = m
@@ -696,12 +717,14 @@ stdoutServer chan = forever $ do
 
 -- It all starts here
 
-data Flag = AuthForce | Help deriving (Show, Read, Eq)
+data Flag = AuthForce | Help | Limit Int deriving (Show, Read, Eq)
 
 flags :: [OptDescr Flag]
 flags = [
 		Option ['A'] ["auth-force"] (NoArg AuthForce)
 			"Force client to authenticate. Some clients need this.",
+		Option ['L'] ["limit"] (ReqArg (Limit . read) "LIMIT")
+			"Limit the number of messages display from any mailbox.",
 		Option ['h'] ["help"] (NoArg Help)
 			"Show this help text."
 	]
@@ -721,6 +744,7 @@ main = do
 	if length args /= 1 || Help `elem` flags || (not . null) errors
 		then usage errors else do
 			let maildir = head args
+			let limit = join $ find isJust $ map getLimit flags
 			_ <- txtHandle stdin -- stdin is text for commands, may switch
 			_ <- binHandle stdout
 			if AuthForce `elem` flags then putStr "* OK " else
@@ -728,8 +752,11 @@ main = do
 			putStr $ capabilities ++ " ready\r\n"
 			stdoutChan <- newChan
 			pthChan <- newChan
-			forkIO_ $ pthServer maildir pthChan stdoutChan
+			forkIO_ $ pthServer maildir limit pthChan stdoutChan
 			forkIO_ $ stdoutServer stdoutChan
 			stdinServer stdoutChan pthChan maildir Nothing
 				-- Ensure pthServer is done
 				`finally` syncCall pthChan MsgFinish
+	where
+	getLimit (Limit x) = Just x
+	getLimit _ = Nothing
