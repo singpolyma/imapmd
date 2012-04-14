@@ -371,7 +371,7 @@ pthServer root chan stdoutChan = withINotify (\inotify -> do
 						let (l,a) = Vector.break (\(_,fp) -> fp == pth) m
 						when (isSelected mbox selec) (writeChan stdoutChan $
 							fromString $ "* " ++
-								show ((Vector.length l)+1) ++ " EXPUNGE\r\n")
+								show (1 + Vector.length l) ++ " EXPUNGE\r\n")
 						return $ Map.adjust (const
 							(v, n, (Vector.++) l (Vector.tail a))) mbox maps'
 					) maps dels
