@@ -15,6 +15,7 @@ import System.IO
 import System.IO.Unsafe (unsafeInterleaveIO)
 import System.INotify
 import System.Locale (defaultTimeLocale)
+import System.Timeout
 import System.Directory
 import System.Console.GetOpt
 import Data.ByteString.UTF8 (fromString, toString)
@@ -644,6 +645,10 @@ stdinServer out getpth maildir selected = do
 						putS $ tag ++ " OK search done\r\n"
 					Nothing -> putS $ tag ++ " NO select mailbox\r\n"
 			_ -> putS (tag ++ " BAD uid command\r\n")
+	command tag "IDLE" _ = do
+		putS $ "+ idling\r\n"
+		idleUntilDone
+		putS $ tag ++ " OK IDLE terminated\r\n"
 	command tag _ _ = putS (tag ++ " BAD unknown command\r\n")
 	list tag ctx (box,_) =
 		let pattern = FP.splitDirectories $ FP.normalise
@@ -728,6 +733,11 @@ stdinServer out getpth maildir selected = do
 					BS.append l bstr
 			_ -> BS.empty -- TODO
 	body _ _ _= BS.empty -- TODO
+	idleUntilDone = do
+		line <- timeout 500000 getLine
+		case line of
+			(Just s) | map toUpper s == "DONE" -> return ()
+			_ -> syncCall getpth MsgDelFlush >> idleUntilDone
 	handleErr tag _ (Left err) =
 		putS (tag ++ " BAD " ++ err ++ "\r\n")
 	handleErr _ f (Right x) = f x
@@ -765,7 +775,7 @@ usage errors = do
 	putStrLn $ usageInfo "imapmd [-A] MAILDIR" flags
 
 capabilities :: String
-capabilities = "IMAP4rev1"
+capabilities = "IMAP4rev1 IDLE"
 
 main :: IO ()
 main = do
