@@ -716,12 +716,7 @@ capabilities = "IMAP4rev1"
 
 main :: IO ()
 main = do
-	(flags, args, errors) <- liftM (getOpt RequireOrder [
-			Option ['A'] ["auth-force"] (NoArg AuthForce)
-				"Force client to authenticate. Some clients need this.",
-			Option ['h'] ["help"] (NoArg Help)
-				"Show this help text."
-		]) getArgs
+	(flags, args, errors) <- liftM (getOpt RequireOrder flags) getArgs
 
 	if length args /= 1 || Help `elem` flags || (not . null) errors
 		then usage errors else do
