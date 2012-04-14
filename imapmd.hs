@@ -309,7 +309,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 		maps <- mapM (\mbox ->
 				uidlistFromFile mbox >>= updateUidlistAndWatch inotify dC mbox
 			) mboxes
-		pthServer' (Map.fromList maps) Nothing dC
+		pthServer' (Map.fromList maps) Nothing dC 0
 	)
 	where
 	uidlistFromFile mbox =
@@ -331,28 +331,30 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 	handleINotify mbox dC (Deleted { filePath = pth }) =
 		writeChan dC (mbox, pth)
 	handleINotify _ _ _ = return () -- Ignore other events
-	pthServer' maps selec dC = do
+	pthServer' maps selec dC lOff = do
+		let maybeFromIndex' = maybeFromIndex lOff
+		let maybeIndexIn' = maybeIndexIn lOff
 		msg <- readChan chan
 		case msg of
-			(MsgAll mbox r) -> writeChan r $ maybeTail $
+			(MsgAll mbox r) -> writeChan r $ maybeTail lOff $
 				trd3 $ getMbox mbox maps
 			(MsgCount mbox r) -> writeChan r $
 				maybeLimit $ Vector.length $ trd3 $ getMbox mbox maps
 			(MsgUID mbox s r) -> let m = trd3 $ getMbox mbox maps in
-				writeChan r $ fst $ (Vector.!) m (s `maybeIndexIn` m)
+				writeChan r $ fst $ (Vector.!) m (s `maybeIndexIn'` m)
 			(MsgSeq mbox uid fuzzy r) -> let m = trd3 $ getMbox mbox maps in
 				writeChan r $
 				case findUID fuzzy m uid of
-					Just i -> i `maybeFromIndex` m
+					Just i -> i `maybeFromIndex'` m
 					Nothing -> error ("UID " ++ show uid ++ "out of range")
 			(MsgPath mbox s r) -> let m = trd3 $ getMbox mbox maps in
-				writeChan r $ snd $ (Vector.!) m (s `maybeIndexIn` m)
+				writeChan r $ snd $ (Vector.!) m (s `maybeIndexIn'` m)
 			(UIDValidity mbox r) ->
 				writeChan r (fst3 $ getMbox mbox maps)
 			(UIDNext mbox r) ->
 				writeChan r (snd3 $ getMbox mbox maps)
 			(MsgMbox sel) ->
-				pthServer' maps sel dC
+				pthServer' maps sel dC 0
 			(MsgNew mbox pth) ->
 				-- If we already know about the unique part of this path,
 				-- it is a rename. Else it is a new message
@@ -362,17 +364,20 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 					Just i -> do -- rename, flags changed
 						let x = (v, n,
 							(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
-						let s = i `maybeFromIndex` m
+						let s = i `maybeFromIndex'` m
 						when (isSelected mbox selec) (printFlags s pth)
 						forkIO_ (writeUidlistWithLock mbox x)
-						pthServer' (Map.adjust (const x) mbox maps) selec dC
+						pthServer' (Map.adjust (const x) mbox maps)
+							selec dC lOff
 					Nothing -> do
 						let x = (v, succ n, Vector.snoc m (n,pth))
 						when (isSelected mbox selec) (writeChan stdoutChan $
 							fromString $ "* EXISTS " ++
 								show (maybeLimit $ Vector.length m) ++ "\r\n")
 						forkIO_ (writeUidlistWithLock mbox x)
-						pthServer' (Map.adjust (const x) mbox maps) selec dC
+						-- Message added, increase soft cap
+						pthServer' (Map.adjust (const x) mbox maps)
+							selec dC (succ lOff)
 			(MsgDelFlush r) -> do
 				dels <- drainChan dC
 				maps' <- foldM (\maps' (mbox,pth) -> do
@@ -380,27 +385,27 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 						let (l,a) = Vector.break (\(_,fp) -> fp == pth) m
 						when (isSelected mbox selec) (writeChan stdoutChan $
 							fromString $ "* " ++ show ((1 + Vector.length l)
-								`maybeFromIndex` m) ++ " EXPUNGE\r\n")
+								`maybeFromIndex'` m) ++ " EXPUNGE\r\n")
 						return $ Map.adjust (const
 							(v, n, (Vector.++) l (Vector.tail a))) mbox maps'
 					) maps dels
 				forkIO_ $ rewriteUidlists maps'
 				writeChan r ()
-				pthServer' maps' selec dC
+				pthServer' maps' selec dC lOff
 			(MsgFinish r) ->
 				-- If we got this message, then we have processed the whole Q
 				writeChan r ()
-		pthServer' maps selec dC
-	maybeFromIndex i x = case limit of
-		(Just l) -> let v = i - (Vector.length x - l) in
+		pthServer' maps selec dC lOff
+	maybeFromIndex lOff i x = case limit of
+		(Just l) -> let v = i - (Vector.length x - (l+lOff)) in
 			(toEnum $ max 0 v) :: SeqNum
-		Nothing -> (toEnum i) :: SeqNum
-	maybeIndexIn s x = let s' = (fromEnum (s :: SeqNum)) in
+		Nothing -> toEnum i :: SeqNum
+	maybeIndexIn lOff s x = let s' = (fromEnum (s :: SeqNum)) in
 		case limit of
-			(Just l) -> s' + (Vector.length x - l)
+			(Just l) -> s' + (Vector.length x - (l+lOff))
 			Nothing -> s'
-	maybeTail x = case limit of
-		(Just l) -> Vector.drop (Vector.length x - l) x
+	maybeTail lOff x = case limit of
+		(Just l) -> Vector.drop (Vector.length x - (l+lOff)) x
 		Nothing -> x
 	maybeLimit x = min x (fromMaybe x limit)
 	fst3 (v,_,_) = v
