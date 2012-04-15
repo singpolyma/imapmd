@@ -319,8 +319,8 @@ writeUidlist (valid, nuid, sorted) mbox = do
 	hClose uidlst
 	renameFile tmpth (FP.joinPath [mbox,"uidlist"])
 
-pthServer :: FilePath -> Maybe Int -> Chan PthMsg -> Chan BS.ByteString -> IO ()
-pthServer root limit chan stdoutChan = withINotify (\inotify -> do
+pthServer :: FilePath -> Maybe Int -> Chan PthMsg -> Chan BS.ByteString -> Chan WriterMsg -> IO ()
+pthServer root limit chan stdoutChan writerChan = withINotify (\inotify -> do
 		mboxes <- maildirFind (const True) (const True) root >>=
 			filterM (\pth -> doesDirectoryExist $ FP.joinPath [pth,"cur"])
 		dC <- newChan -- Channel to store pending deletes
@@ -385,7 +385,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 							(Vector.//) m [(i,(fst $ (Vector.!) m i,pth))])
 						let s = i `maybeFromIndex'` m
 						when (isSelected mbox selec) (printFlags s pth)
-						forkIO_ (writeUidlistWithLock mbox x)
+						writeChan writerChan (Write mbox x)
 						pthServer' (Map.adjust (const x) mbox maps)
 							selec dC lOff
 					Nothing -> do
@@ -393,7 +393,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 						when (isSelected mbox selec) (writeChan stdoutChan $
 							fromString $ "* " ++ show (maybeLimit (succ lOff) $
 								Vector.length m) ++ " EXISTS\r\n")
-						forkIO_ (writeUidlistWithLock mbox x)
+						writeChan writerChan (Write mbox x)
 						-- Message added, increase soft cap
 						pthServer' (Map.adjust (const x) mbox maps)
 							selec dC (succ lOff)
@@ -408,7 +408,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 						return $ Map.adjust (const
 							(v, n, (Vector.++) l (Vector.tail a))) mbox maps'
 					) maps dels
-				when (not $ null dels) (forkIO_ $ rewriteUidlists maps')
+				when (not $ null dels) (rewriteUidlists maps')
 				writeChan r ()
 				pthServer' maps' selec dC lOff
 			(MsgFinish r) ->
@@ -447,11 +447,23 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 		return k
 	printFlags i pth = writeChan stdoutChan $ fromString $ "* " ++
 		show i ++ " FETCH (FLAGS (" ++ unwords (getFlags pth) ++ "))\r\n"
-	writeUidlistWithLock mbox (v,n,m) =
-		FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $
-			writeUidlist (v,n,Vector.toList m) mbox
-	rewriteUidlists maps =
-		mapM_ (uncurry writeUidlistWithLock) (Map.toList maps)
+	rewriteUidlists maps = mapM_
+		(\(mbox,x) -> writeChan writerChan (Write mbox x)) (Map.toList maps)
+
+-- writerServer handles writing to uidlist files
+-- NOTE: pthServer calls updateUidlist before it starts with messages
+-- this is safe, because that one is protected/flushed by MsgFinish
+
+data WriterMsg = Write String (Int,UID,Vector (UID,FilePath)) | WriterFinish (Chan ())
+
+writerServer :: Chan WriterMsg -> IO ()
+writerServer chan = forever $ do
+	msg <- readChan chan
+	case msg of
+		(Write mbox (v,n,m)) ->
+			FL.withLock (FP.joinPath [mbox,"uidlist.lock"]) FL.WriteLock $
+				writeUidlist (v,n,Vector.toList m) mbox
+		(WriterFinish r) -> writeChan r ()
 
 -- stdinServer handles the incoming IMAP commands
 
@@ -792,11 +804,14 @@ main = do
 			putStr $ capabilities ++ " ready\r\n"
 			stdoutChan <- newChan
 			pthChan <- newChan
-			forkIO_ $ pthServer maildir limit pthChan stdoutChan
+			writerChan <- newChan
+			forkIO_ $ writerServer writerChan
+			forkIO_ $ pthServer maildir limit pthChan stdoutChan writerChan
 			forkIO_ $ stdoutServer stdoutChan
 			stdinServer stdoutChan pthChan maildir Nothing
 				-- Ensure pthServer is done
 				`finally` syncCall pthChan MsgFinish
+				`finally` syncCall writerChan WriterFinish
 	where
 	getLimit (Limit x) = Just x
 	getLimit _ = Nothing
