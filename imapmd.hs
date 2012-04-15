@@ -408,7 +408,7 @@ pthServer root limit chan stdoutChan = withINotify (\inotify -> do
 						return $ Map.adjust (const
 							(v, n, (Vector.++) l (Vector.tail a))) mbox maps'
 					) maps dels
-				forkIO_ $ rewriteUidlists maps'
+				when (not $ null dels) (forkIO_ $ rewriteUidlists maps')
 				writeChan r ()
 				pthServer' maps' selec dC lOff
 			(MsgFinish r) ->
@@ -582,7 +582,7 @@ stdinServer out getpth maildir selected = do
 	case line of
 		(tag:cmd:rest) -> do
 			let cmd' = map toUpper cmd
-			when (cmd' `notElem` ["FETCH","STORE","SEARCH","UID"]) (
+			when (cmd' `notElem` ["FETCH","STORE","SEARCH","UID","LOGOUT"]) (
 					syncCall getpth MsgDelFlush
 				)
 			command tag (map toUpper cmd') rest
