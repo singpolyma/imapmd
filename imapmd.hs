@@ -308,7 +308,7 @@ updateUidlist (valid, nuid, uids) mbox = do
 -- WARNING: this function must *only* be called on a sorted list!
 writeUidlist :: (Int, UID, [(UID,FilePath)]) -> FilePath -> IO ()
 writeUidlist (valid, nuid, sorted) mbox = do
-	(tmpth, uidlst) <- openTempFile mbox "uidlist"
+	(tmpth, uidlst) <- openTempFile (FP.joinPath [mbox,"tmp"]) "uidlist"
 	-- Write header
 	hPutStrLn uidlst $ "3 V" ++ show valid ++ " N" ++ show nuid
 	-- Write content
