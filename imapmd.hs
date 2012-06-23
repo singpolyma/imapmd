@@ -547,7 +547,7 @@ imapSearch _ _ xs (q:_) =
 --imapSearch _ _ _ _ = error "Unsupported IMAP search query"
 
 maildirFind :: ([String] -> Bool) -> ([String] -> Bool) -> FilePath -> IO [FilePath]
-maildirFind fpred rpred mbox = FP.find
+maildirFind fpred rpred mbox = FP.findp
 	(FP.filterPredicate (\x t -> FP.isDirectory t && normPred fpred x))
 	(FP.recursePredicate (normPred rpred))
 	mbox
