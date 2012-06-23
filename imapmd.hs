@@ -60,11 +60,16 @@ instance Enum MIME.Month where
 fullDate2UTCTime :: MIME.FullDate -> UTCTime
 fullDate2UTCTime (MIME.FullDate _
 	(MIME.Date day month year)
-	(MIME.Time (MIME.TimeOfDay hour minute msecond) timezone)) =
-	let second = fromMaybe 0 msecond in
-		UTCTime (fromGregorian (toInteger year) (fromEnum month) day)
-			(secondsToDiffTime $ toInteger $
-				(60*60*(hour+timezone)) + (60*minute) + second)
+	(MIME.Time (MIME.TimeOfDay hour minute msecond) mtimezone)) =
+	UTCTime (fromGregorian (toInteger year) (fromEnum month) day)
+		(secondsToDiffTime $ toInteger $
+			(60*60*hour) + (60*(minute+timezone)) + second)
+	where
+	second = fromMaybe 0 msecond
+	-- Gross hack because timezone is an int, but the last two digits are in minutes
+	timezone = (tzhour*60) + tzmin
+	tzmin = read $ reverse $ take 2 $ reverse $ show mtimezone
+	tzhour = mtimezone `div` 100
 
 -- Other utilities
 
